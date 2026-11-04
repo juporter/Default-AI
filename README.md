@@ -1,6 +1,6 @@
-# Default-AI
+# Default AI Prompt
 
-**Multi-LLM Prompt**: a small web app for sending one prompt to several AI models at once and comparing the answers side by side.
+A small web app for sending one prompt to several AI models at once and comparing the answers side by side.
 
 Supported providers:
 

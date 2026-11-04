@@ -235,7 +235,7 @@ test('serves the UI and blocks path traversal', async () => {
   let res = await fetch(`${base}/`);
   assert.equal(res.status, 200);
   assert.match(res.headers.get('content-type'), /text\/html/);
-  assert.match(await res.text(), /Multi-LLM Prompt/);
+  assert.match(await res.text(), /Default AI Prompt/);
 
   res = await fetch(`${base}/app.js`);
   assert.match(res.headers.get('content-type'), /javascript/);

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Multi-LLM prompt server.
+// Default AI Prompt server.
 //
 // Serves the web UI from ./public and proxies prompts to each provider so the
 // API keys stay on the server and are never sent to the browser.
@@ -409,7 +409,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
 
   server.listen(port, host, () => {
     const shownHost = host.includes(':') ? `[${host}]` : host;
-    console.log(`\nMulti-LLM is running at http://${shownHost}:${port}\n`);
+    console.log(`\nDefault AI Prompt is running at http://${shownHost}:${port}\n`);
     for (const p of resolveProviders(env)) {
       console.log(
         p.apiKey
