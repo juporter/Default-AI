@@ -209,6 +209,8 @@ button.small {
   border-radius: var(--radius);
   padding: 10px 12px;
   display: grid;
+  /* minmax(0, …) stops a long model name from widening the card */
+  grid-template-columns: minmax(0, 1fr);
   gap: 8px;
   background: var(--surface);
   transition: border-color 0.15s, background 0.15s;
@@ -302,6 +304,7 @@ button.small {
 .model-select,
 .model-custom {
   width: 100%;
+  min-width: 0;
   font: inherit;
   font-size: 0.85rem;
   padding: 5px 8px;
@@ -624,6 +627,8 @@ details summary {
 .markdown table {
   border-collapse: collapse;
   font-size: 0.9em;
+  /* Keep words whole in cells; wide tables scroll inside .table-wrap instead */
+  overflow-wrap: normal;
 }
 
 .markdown th,
