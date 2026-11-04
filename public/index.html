@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Multi-LLM Prompt</title>
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="styles.css" />
+    <script type="module" src="app.js"></script>
+  </head>
+  <body>
+    <div class="page">
+      <header class="masthead">
+        <h1>Multi-LLM Prompt</h1>
+        <p>Send one prompt to several models and compare the answers side by side.</p>
+      </header>
+
+      <p id="notice" class="notice" role="alert" hidden></p>
+
+      <section class="panel" aria-labelledby="models-heading">
+        <div class="panel-head">
+          <h2 id="models-heading">Models</h2>
+          <div class="panel-actions">
+            <button type="button" id="select-all" class="ghost small">Select all</button>
+            <button type="button" id="select-none" class="ghost small">Clear</button>
+          </div>
+        </div>
+        <div id="provider-list" class="provider-list"></div>
+      </section>
+
+      <form id="prompt-form" class="panel compose">
+        <label for="prompt" class="field-label">Prompt</label>
+        <textarea id="prompt" rows="5" placeholder="Ask all the selected models something…"></textarea>
+
+        <details id="system-details">
+          <summary>System prompt <span class="muted">(optional, sent to every model)</span></summary>
+          <textarea id="system" rows="3" placeholder="e.g. Answer in three sentences or fewer."></textarea>
+        </details>
+
+        <div class="compose-footer">
+          <span class="muted shortcut"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> to send</span>
+          <button type="submit" id="send" class="primary" disabled>Select a model</button>
+        </div>
+      </form>
+
+      <section aria-labelledby="results-heading">
+        <div class="results-head">
+          <h2 id="results-heading">Responses</h2>
+          <button type="button" id="clear-results" class="ghost small" hidden>Clear responses</button>
+        </div>
+        <p id="empty-results" class="empty">Answers from each selected model will appear here as they arrive.</p>
+        <div id="results" class="results" aria-live="polite"></div>
+      </section>
+    </div>
+  </body>
+</html>

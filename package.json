@@ -1,0 +1,16 @@
+{
+  "name": "default-ai",
+  "version": "1.0.0",
+  "description": "Send one prompt to OpenAI, Claude, Meta, Gemini and Grok at once and compare the answers.",
+  "private": true,
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20.12"
+  },
+  "license": "MIT"
+}
