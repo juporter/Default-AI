@@ -13,11 +13,17 @@ import {
 
 const byId = (env = {}) => Object.fromEntries(resolveProviders(env).map((p) => [p.id, p]));
 
-test('all five providers are defined', () => {
+test('all eight providers are defined', () => {
   assert.deepEqual(
     PROVIDERS.map((p) => p.name),
-    ['OpenAI', 'Claude', 'Meta', 'Gemini', 'Grok'],
+    ['OpenAI', 'Claude', 'Meta', 'Gemini', 'Grok', 'DeepSeek', 'Perplexity', 'Kimi'],
   );
+  for (const p of PROVIDERS) assert.ok(p.models.includes(p.defaultModel), `${p.id} suggests its default model`);
+});
+
+test('Kimi accepts either key name', () => {
+  assert.equal(byId({ MOONSHOT_API_KEY: 'm' }).kimi.apiKey, 'm');
+  assert.equal(byId({ KIMI_API_KEY: 'k', MOONSHOT_API_KEY: 'm' }).kimi.apiKey, 'k');
 });
 
 test('resolveProviders reads keys, alternate key names, models and base URLs from env', () => {
@@ -40,9 +46,10 @@ test('publicInfo never exposes the API key', () => {
   assert.ok(!JSON.stringify(info).includes('sk-ant-secret'));
 });
 
-test('OpenAI-compatible request (OpenAI, Meta, Grok)', () => {
-  for (const id of ['openai', 'meta', 'xai']) {
-    const p = byId({ OPENAI_API_KEY: 'k', META_API_KEY: 'k', XAI_API_KEY: 'k' })[id];
+test('OpenAI-compatible request (OpenAI, Meta, Grok, DeepSeek, Kimi)', () => {
+  const env = { OPENAI_API_KEY: 'k', META_API_KEY: 'k', XAI_API_KEY: 'k', DEEPSEEK_API_KEY: 'k', KIMI_API_KEY: 'k' };
+  for (const id of ['openai', 'meta', 'xai', 'deepseek', 'kimi']) {
+    const p = byId(env)[id];
     const { url, init } = buildChatRequest(p, { model: 'm', prompt: 'Hi', system: 'Be brief', maxTokens: 100 });
     assert.equal(url, `${p.baseUrl}/chat/completions`);
     assert.equal(init.headers.authorization, 'Bearer k');
@@ -91,6 +98,76 @@ test('Gemini model IDs cannot change the request path', () => {
   const p = byId({ GEMINI_API_KEY: 'k' }).gemini;
   const { url } = buildChatRequest(p, { model: '../../evil?x=1', prompt: 'Hi', system: '', maxTokens: 1 });
   assert.ok(url.startsWith('https://generativelanguage.googleapis.com/v1beta/models/..%2F..%2Fevil%3Fx%3D1:'));
+});
+
+test('DeepSeek and Kimi use their own hosts', () => {
+  const p = byId({ DEEPSEEK_API_KEY: 'k', KIMI_API_KEY: 'k' });
+  assert.equal(buildChatRequest(p.deepseek, { model: 'm', prompt: 'Hi' }).url, 'https://api.deepseek.com/chat/completions');
+  assert.equal(buildChatRequest(p.kimi, { model: 'm', prompt: 'Hi' }).url, 'https://api.moonshot.ai/v1/chat/completions');
+});
+
+test('Perplexity request uses the Agent API with web search on', () => {
+  const p = byId({ PERPLEXITY_API_KEY: 'k' }).perplexity;
+  const { url, init } = buildChatRequest(p, { model: 'perplexity/sonar', prompt: 'Hi', system: 'Be brief', maxTokens: 900 });
+  assert.equal(url, 'https://api.perplexity.ai/v1/agent');
+  assert.equal(init.headers.authorization, 'Bearer k');
+  assert.deepEqual(JSON.parse(init.body), {
+    model: 'perplexity/sonar',
+    input: 'Hi',
+    instructions: 'Be brief',
+    tools: [{ type: 'web_search' }],
+  });
+  // Anthropic models on the Agent API need an output limit.
+  const claude = JSON.parse(buildChatRequest(p, { model: 'anthropic/x', prompt: 'Hi', system: '', maxTokens: 900 }).init.body);
+  assert.equal(claude.max_output_tokens, 900);
+  assert.equal('instructions' in claude, false);
+});
+
+test('parses a Perplexity Agent API response with sources', () => {
+  const p = byId().perplexity;
+  const out = parseChatResponse(p, {
+    model: 'perplexity/sonar',
+    status: 'completed',
+    output: [
+      {
+        type: 'search_results',
+        queries: ['q'],
+        results: [
+          { id: 1, title: 'Example', url: 'https://example.com/a', snippet: '…' },
+          { id: 2, title: '', url: 'https://example.com/b' },
+          { id: 3, title: 'Dup', url: 'https://example.com/a' },
+          { id: 4, title: 'Bad', url: 'javascript:alert(1)' },
+        ],
+      },
+      { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Answer [web:1]', annotations: [] }] },
+    ],
+    usage: { input_tokens: 7, output_tokens: 3, total_tokens: 10 },
+  });
+  assert.deepEqual(out, {
+    text: 'Answer [web:1]',
+    model: 'perplexity/sonar',
+    usage: { input: 7, output: 3 },
+    stopReason: undefined,
+    sources: [
+      { title: 'Example', url: 'https://example.com/a' },
+      { title: 'https://example.com/b', url: 'https://example.com/b' },
+    ],
+  });
+});
+
+test('OpenAI-compatible url_citation annotations become sources', () => {
+  const p = byId().openai;
+  const out = parseChatResponse(p, {
+    choices: [
+      {
+        message: {
+          content: 'Hi',
+          annotations: [{ type: 'url_citation', url_citation: { url: 'https://example.org', title: 'Ex' } }],
+        },
+      },
+    ],
+  });
+  assert.deepEqual(out.sources, [{ title: 'Ex', url: 'https://example.org' }]);
 });
 
 test('parses an OpenAI-compatible response', () => {
@@ -168,8 +245,10 @@ test('model lists are normalized per provider', () => {
 });
 
 test('model list requests use each provider’s auth', () => {
-  const p = byId({ OPENAI_API_KEY: 'a', ANTHROPIC_API_KEY: 'b', GEMINI_API_KEY: 'c' });
+  const p = byId({ OPENAI_API_KEY: 'a', ANTHROPIC_API_KEY: 'b', GEMINI_API_KEY: 'c', PERPLEXITY_API_KEY: 'd' });
   assert.equal(buildModelsRequest(p.openai).init.headers.authorization, 'Bearer a');
+  assert.equal(buildModelsRequest(p.perplexity).url, 'https://api.perplexity.ai/v1/models');
+  assert.equal(buildModelsRequest(p.perplexity).init.headers.authorization, 'Bearer d');
   assert.equal(buildModelsRequest(p.anthropic).init.headers['x-api-key'], 'b');
   assert.equal(buildModelsRequest(p.gemini).init.headers['x-goog-api-key'], 'c');
 });

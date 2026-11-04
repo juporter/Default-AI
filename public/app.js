@@ -1,11 +1,15 @@
-import { renderMarkdown } from './markdown.js';
+import { h, $, formatBytes } from './dom.js';
+import { createCard } from './cards.js';
+import { buildPrompt, checkFile, looksBinary } from './prompt.js';
+import * as store from './store.js';
+import { setupAds } from './ads.js';
+import { initHistory, showHistory, markHistoryStale } from './history.js';
+import { initSettings, showSettings } from './settings-view.js';
 
 const STORAGE_KEY = 'multi-llm:prefs:v1';
 const CUSTOM = '__custom__';
-// Stop reasons that mean the answer was cut off.
-const TRUNCATED = new Set(['length', 'max_tokens', 'MAX_TOKENS']);
+const VIEWS = ['compare', 'history', 'settings'];
 
-const $ = (selector) => document.querySelector(selector);
 const els = {
   providerList: $('#provider-list'),
   notice: $('#notice'),
@@ -16,6 +20,10 @@ const els = {
   send: $('#send'),
   selectAll: $('#select-all'),
   selectNone: $('#select-none'),
+  attach: $('#attach'),
+  attachInput: $('#attach-input'),
+  attachments: $('#attachments'),
+  attachError: $('#attach-error'),
   results: $('#results'),
   emptyResults: $('#empty-results'),
   clearResults: $('#clear-results'),
@@ -25,6 +33,7 @@ const state = {
   providers: [],
   prefs: loadPrefs(),
   models: {}, // provider id -> string[] loaded from the provider
+  attachments: [], // {name, size, text}
 };
 
 // ---------------------------------------------------------------------------
@@ -50,23 +59,20 @@ function savePrefs() {
 }
 
 // ---------------------------------------------------------------------------
-// Tiny DOM helper
+// Views: #compare (default), #history, #settings
 // ---------------------------------------------------------------------------
 
-function h(tag, attrs = {}, ...children) {
-  const el = document.createElement(tag);
-  for (const [key, value] of Object.entries(attrs)) {
-    if (value === false || value == null) continue;
-    if (key === 'class') el.className = value;
-    else if (key === 'text') el.textContent = value;
-    else if (key.startsWith('on')) el.addEventListener(key.slice(2), value);
-    else if (key in el && typeof value !== 'string') el[key] = value;
-    else el.setAttribute(key, value === true ? '' : value);
+function showView() {
+  const requested = location.hash.slice(1);
+  const name = VIEWS.includes(requested) ? requested : 'compare';
+  for (const view of VIEWS) {
+    $(`#view-${view}`).hidden = view !== name;
+    const link = $(`#nav-${view}`);
+    if (view === name) link.setAttribute('aria-current', 'page');
+    else link.removeAttribute('aria-current');
   }
-  for (const child of children.flat()) {
-    if (child != null && child !== false) el.append(child);
-  }
-  return el;
+  if (name === 'history') showHistory();
+  if (name === 'settings') showSettings();
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +106,7 @@ function renderProviders() {
 function providerCard(p) {
   const checkbox = h('input', {
     type: 'checkbox',
+    id: `pick-${p.id}`,
     checked: isSelected(p),
     disabled: !p.configured,
     'aria-describedby': `status-${p.id}`,
@@ -136,8 +143,8 @@ function providerCard(p) {
         { class: 'setup' },
         'Add ',
         h('code', { text: p.keyEnv }),
-        ' to ',
-        h('code', { text: '.env' }),
+        ' in ',
+        h('a', { href: '#settings', text: 'Settings' }),
         p.keyUrl ? [' · ', h('a', { href: p.keyUrl, target: '_blank', rel: 'noopener noreferrer', text: 'Get a key' })] : null,
       ),
     );
@@ -146,7 +153,7 @@ function providerCard(p) {
 }
 
 function modelPicker(p) {
-  const select = h('select', { class: 'model-select', 'aria-label': `${p.name} model` });
+  const select = h('select', { class: 'model-select', id: `model-${p.id}`, 'aria-label': `${p.name} model` });
   const custom = h('input', {
     class: 'model-custom',
     type: 'text',
@@ -175,9 +182,9 @@ function modelPicker(p) {
     }
   });
 
-  const fillOptions = () => {
+  const fillOptions = (listed) => {
     const chosen = currentModel(p);
-    const ids = [...new Set([p.defaultModel, chosen, ...(state.models[p.id] || [])])].sort((a, b) =>
+    const ids = [...new Set([p.defaultModel, chosen, ...(listed || p.models || [])])].sort((a, b) =>
       a === p.defaultModel ? -1 : b === p.defaultModel ? 1 : a.localeCompare(b),
     );
     select.replaceChildren(
@@ -186,7 +193,7 @@ function modelPicker(p) {
     );
     select.value = chosen;
   };
-  fillOptions();
+  fillOptions(state.models[p.id]);
 
   const load = async () => {
     meta.textContent = 'Loading models…';
@@ -197,11 +204,11 @@ function modelPicker(p) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
       state.models[p.id] = data.models;
-      if (custom.hidden) fillOptions();
-      meta.textContent = `${data.models.length} models available`;
+      if (custom.hidden) fillOptions(data.models);
+      meta.textContent = `${data.models.length} model${data.models.length === 1 ? '' : 's'} available`;
     } catch (err) {
-      meta.textContent = 'Could not list models';
-      meta.title = err.message;
+      meta.textContent = 'Showing suggested models';
+      meta.title = `Couldn't load the full list: ${err.message}`;
       meta.className = 'model-meta warn';
     }
   };
@@ -213,10 +220,10 @@ function modelPicker(p) {
 /** Reflect state.prefs.selected in the checkboxes without rebuilding the cards. */
 function syncSelection() {
   for (const p of state.providers) {
-    const card = els.providerList.querySelector(`[data-provider="${p.id}"]`);
-    if (!card) continue;
-    card.querySelector('input[type="checkbox"]').checked = isSelected(p);
-    card.classList.toggle('selected', isSelected(p));
+    const box = $(`#pick-${p.id}`);
+    if (!box) continue;
+    box.checked = isSelected(p);
+    box.closest('.provider').classList.toggle('selected', isSelected(p));
   }
   updateSendButton();
 }
@@ -232,8 +239,62 @@ function updateSendButton() {
 }
 
 // ---------------------------------------------------------------------------
+// Attachments
+// ---------------------------------------------------------------------------
+
+async function addFiles(files) {
+  const problems = [];
+  for (const file of files) {
+    const used = state.attachments.reduce((n, a) => n + a.size, 0);
+    const problem = checkFile(file, used);
+    if (problem) {
+      problems.push(problem);
+      continue;
+    }
+    const text = await file.text();
+    if (looksBinary(text)) {
+      problems.push(`${file.name} doesn't look like a text file.`);
+      continue;
+    }
+    state.attachments.push({ name: file.name, size: file.size, text });
+  }
+  renderAttachments();
+  els.attachError.textContent = problems.join(' ');
+  els.attachError.hidden = !problems.length;
+}
+
+function renderAttachments() {
+  els.attachments.replaceChildren(
+    ...state.attachments.map((file, index) =>
+      h(
+        'li',
+        { class: 'attachment' },
+        h('span', { class: 'attachment-name', text: file.name }),
+        h('span', { class: 'attachment-size', text: formatBytes(file.size) }),
+        h('button', {
+          type: 'button',
+          class: 'attachment-remove',
+          'aria-label': `Remove ${file.name}`,
+          text: '×',
+          onclick: () => {
+            state.attachments.splice(index, 1);
+            renderAttachments();
+            els.attachError.hidden = true;
+          },
+        }),
+      ),
+    ),
+  );
+  els.attachments.hidden = !state.attachments.length;
+}
+
+// ---------------------------------------------------------------------------
 // Running a prompt
 // ---------------------------------------------------------------------------
+
+function newId() {
+  return globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
 
 async function sendPrompt(event) {
   event.preventDefault();
@@ -249,19 +310,31 @@ async function sendPrompt(event) {
   state.prefs.system = system;
   savePrefs();
 
+  const attachments = state.attachments.map((a) => ({ ...a }));
+  const fullPrompt = buildPrompt(prompt, attachments);
   const controller = new AbortController();
-  const run = createRun(prompt, targets, controller);
+  const run = createRun(prompt, attachments, targets, controller);
   els.results.prepend(run.el);
   els.emptyResults.hidden = true;
   els.clearResults.hidden = false;
 
-  await Promise.allSettled(
-    targets.map((p, index) => askProvider(p, currentModel(p), prompt, system, run.cards[index], controller.signal)),
+  const responses = await Promise.all(
+    targets.map((p, index) => askProvider(p, currentModel(p), fullPrompt, system, run.cards[index], controller.signal)),
   );
   run.done();
+
+  // Save to History.
+  const record = { id: newId(), createdAt: run.createdAt, prompt, system, attachments, responses };
+  try {
+    await store.putMany('runs', [record]);
+    markHistoryStale();
+  } catch (err) {
+    showNotice(`This answer couldn't be saved to History: ${err.message}`);
+  }
 }
 
-function createRun(prompt, targets, controller) {
+function createRun(prompt, attachments, targets, controller) {
+  const createdAt = new Date().toISOString();
   const cancel = h('button', { type: 'button', class: 'ghost small', text: 'Cancel', onclick: () => controller.abort() });
   const cards = targets.map((p) => createCard(p, currentModel(p)));
   const el = h(
@@ -271,98 +344,19 @@ function createRun(prompt, targets, controller) {
       'header',
       { class: 'run-header' },
       h('p', { class: 'run-prompt', title: prompt, text: prompt.length > 220 ? `${prompt.slice(0, 220)}…` : prompt }),
-      h('span', { class: 'run-time', text: new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) }),
+      h('span', { class: 'run-time', text: new Date(createdAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) }),
       cancel,
     ),
+    attachments.length
+      ? h('p', { class: 'run-files', text: `Files: ${attachments.map((a) => a.name).join(', ')}` })
+      : null,
     h('div', { class: 'cards' }, cards.map((c) => c.el)),
   );
-  return { el, cards, done: () => cancel.remove() };
-}
-
-function createCard(p, model) {
-  const badge = h('span', { class: 'badge', text: '0.0s' });
-  const modelLabel = h('span', { class: 'card-model', text: model });
-  const body = h('div', { class: 'card-body' }, h('div', { class: 'spinner', 'aria-label': 'Waiting for answer' }));
-  const footer = h('footer', { class: 'card-footer', hidden: true });
-  const el = h(
-    'article',
-    { class: 'card', 'data-provider': p.id, 'data-state': 'loading' },
-    h(
-      'header',
-      { class: 'card-header' },
-      h('div', { class: 'card-title' }, h('span', { class: 'provider-dot', 'aria-hidden': 'true' }), h('h3', { text: p.name }), modelLabel),
-      badge,
-    ),
-    body,
-    footer,
-  );
-
-  const started = performance.now();
-  const seconds = () => ((performance.now() - started) / 1000).toFixed(1);
-  const timer = setInterval(() => (badge.textContent = `${seconds()}s`), 100);
-
-  return {
-    el,
-    succeed(data) {
-      clearInterval(timer);
-      el.dataset.state = 'done';
-      badge.textContent = `${seconds()}s`;
-      if (data.model) modelLabel.textContent = data.model;
-
-      const text = data.text || '';
-      const rendered = h('div', { class: 'markdown' });
-      rendered.innerHTML = text ? renderMarkdown(text) : '<p class="muted">(empty response)</p>';
-      const raw = h('pre', { class: 'raw', hidden: true, text });
-      body.replaceChildren(rendered, raw);
-
-      const usage = [];
-      if (data.usage?.input != null) usage.push(`${data.usage.input.toLocaleString()} in`);
-      if (data.usage?.output != null) usage.push(`${data.usage.output.toLocaleString()} out`);
-      const copy = h('button', {
-        type: 'button',
-        class: 'ghost small',
-        text: 'Copy',
-        onclick: async () => {
-          try {
-            await navigator.clipboard.writeText(text);
-            copy.textContent = 'Copied';
-          } catch {
-            copy.textContent = 'Copy failed';
-          }
-          setTimeout(() => (copy.textContent = 'Copy'), 1500);
-        },
-      });
-      const toggle = h('button', {
-        type: 'button',
-        class: 'ghost small',
-        text: 'Raw',
-        onclick: () => {
-          raw.hidden = !raw.hidden;
-          rendered.hidden = !raw.hidden;
-          toggle.textContent = raw.hidden ? 'Raw' : 'Formatted';
-        },
-      });
-      footer.replaceChildren(
-        ...[
-          h('span', { class: 'usage', text: usage.length ? `${usage.join(' · ')} tokens` : '' }),
-          TRUNCATED.has(data.stopReason) && h('span', { class: 'warn', text: 'Cut off (token limit)' }),
-          h('span', { class: 'spacer' }),
-          toggle,
-          copy,
-        ].filter(Boolean),
-      );
-      footer.hidden = false;
-    },
-    fail(message) {
-      clearInterval(timer);
-      el.dataset.state = 'error';
-      badge.textContent = 'Error';
-      body.replaceChildren(h('p', { class: 'error', text: message }));
-    },
-  };
+  return { el, cards, createdAt, done: () => cancel.remove() };
 }
 
 async function askProvider(p, model, prompt, system, card, signal) {
+  const base = { provider: p.id, providerName: p.name, model, usage: {}, stopReason: '', sources: [] };
   try {
     const res = await fetch('/api/chat', {
       method: 'POST',
@@ -372,15 +366,52 @@ async function askProvider(p, model, prompt, system, card, signal) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-    card.succeed(data);
+    const seconds = card.elapsed();
+    card.succeed({ ...data, seconds });
+    return {
+      ...base,
+      model: data.model || model,
+      text: data.text || '',
+      error: '',
+      seconds,
+      usage: data.usage || {},
+      stopReason: data.stopReason || '',
+      sources: data.sources || [],
+    };
   } catch (err) {
-    card.fail(err.name === 'AbortError' ? 'Cancelled' : err.message || 'Request failed');
+    const message = err.name === 'AbortError' ? 'Cancelled' : err.message || 'Request failed';
+    const seconds = card.elapsed();
+    card.fail(message);
+    return { ...base, text: '', error: message, seconds };
   }
+}
+
+/** Called from History: put an old prompt (and its files) back in the composer. */
+function usePrompt({ prompt, system = '', attachments = [] }) {
+  els.prompt.value = prompt;
+  els.system.value = system;
+  if (system) els.systemDetails.open = true;
+  state.attachments = attachments.map((a) => ({ name: a.name, size: a.size ?? a.text.length, text: a.text }));
+  renderAttachments();
+  els.attachError.hidden = true;
+  location.hash = '#compare';
+  els.prompt.focus();
 }
 
 // ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
+
+function showNotice(message) {
+  els.notice.textContent = message;
+  els.notice.hidden = false;
+}
+
+function onSettingsApplied({ providers, adsChanged }) {
+  state.providers = providers;
+  renderProviders();
+  if (adsChanged) showNotice('Ad settings changed. Reload the page to see them.');
+}
 
 async function init() {
   els.form.addEventListener('submit', sendPrompt);
@@ -408,29 +439,56 @@ async function init() {
     els.clearResults.hidden = true;
   });
 
+  els.attach.addEventListener('click', () => els.attachInput.click());
+  els.attachInput.addEventListener('change', async () => {
+    await addFiles([...els.attachInput.files]);
+    els.attachInput.value = '';
+  });
+  els.form.addEventListener('dragover', (e) => {
+    if ([...(e.dataTransfer?.types || [])].includes('Files')) {
+      e.preventDefault();
+      els.form.classList.add('dropping');
+    }
+  });
+  els.form.addEventListener('dragleave', (e) => {
+    if (!els.form.contains(e.relatedTarget)) els.form.classList.remove('dropping');
+  });
+  els.form.addEventListener('drop', (e) => {
+    e.preventDefault();
+    els.form.classList.remove('dropping');
+    if (e.dataTransfer?.files?.length) addFiles([...e.dataTransfer.files]);
+  });
+
   if (state.prefs.system) {
     els.system.value = state.prefs.system;
     els.systemDetails.open = true;
   }
 
+  initHistory({
+    usePrompt,
+    providerById: (id) => state.providers.find((p) => p.id === id),
+  });
+  initSettings({
+    getProviders: () => state.providers,
+    onApplied: onSettingsApplied,
+  });
+  window.addEventListener('hashchange', showView);
+
   try {
-    const res = await fetch('/api/providers');
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    state.providers = (await res.json()).providers;
+    const [providersRes, configRes] = await Promise.all([fetch('/api/providers'), fetch('/api/config')]);
+    if (!providersRes.ok) throw new Error(`HTTP ${providersRes.status}`);
+    state.providers = (await providersRes.json()).providers;
+    if (configRes.ok) setupAds((await configRes.json()).ads);
   } catch (err) {
     showNotice(`Could not reach the server (${err.message}). Is "npm start" running?`);
     return;
   }
 
   renderProviders();
+  showView();
   if (!state.providers.some((p) => p.configured)) {
-    showNotice('No API keys found. Copy .env.example to .env, add at least one key, then restart the server.');
+    showNotice('No API keys yet. Add them in Settings, or copy .env.example to .env and restart the server.');
   }
-}
-
-function showNotice(message) {
-  els.notice.textContent = message;
-  els.notice.hidden = false;
 }
 
 init();

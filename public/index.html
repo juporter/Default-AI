@@ -11,46 +11,155 @@
   <body>
     <div class="page">
       <header class="masthead">
-        <h1>Multi-LLM Prompt</h1>
-        <p>Send one prompt to several models and compare the answers side by side.</p>
+        <div>
+          <h1>Multi-LLM Prompt</h1>
+          <p>Send one prompt to several models and compare the answers side by side.</p>
+        </div>
+        <nav class="tabs" aria-label="Sections">
+          <a href="#compare" id="nav-compare">Compare</a>
+          <a href="#history" id="nav-history">History</a>
+          <a href="#settings" id="nav-settings">Settings</a>
+        </nav>
       </header>
+
+      <aside id="ad-top" class="ad-slot" aria-label="Advertisement" hidden></aside>
 
       <p id="notice" class="notice" role="alert" hidden></p>
 
-      <section class="panel" aria-labelledby="models-heading">
-        <div class="panel-head">
-          <h2 id="models-heading">Models</h2>
-          <div class="panel-actions">
-            <button type="button" id="select-all" class="ghost small">Select all</button>
-            <button type="button" id="select-none" class="ghost small">Clear</button>
+      <main>
+        <!-- Compare ------------------------------------------------------- -->
+        <section id="view-compare" class="view" aria-label="Compare models">
+          <section class="panel" aria-labelledby="models-heading">
+            <div class="panel-head">
+              <h2 id="models-heading">Models</h2>
+              <div class="panel-actions">
+                <button type="button" id="select-all" class="ghost small">Select all</button>
+                <button type="button" id="select-none" class="ghost small">Clear</button>
+              </div>
+            </div>
+            <div id="provider-list" class="provider-list"></div>
+          </section>
+
+          <form id="prompt-form" class="panel compose">
+            <label for="prompt" class="field-label">Prompt</label>
+            <textarea id="prompt" rows="5" placeholder="Ask all the selected models something…"></textarea>
+
+            <div class="attach-row">
+              <button type="button" id="attach" class="ghost small">Attach files</button>
+              <input type="file" id="attach-input" multiple hidden />
+              <span class="muted hint">Text files (code, Markdown, CSV, JSON…) up to 1 MB each. You can also drop files here.</span>
+            </div>
+            <ul id="attachments" class="attachments" aria-label="Attached files" hidden></ul>
+            <p id="attach-error" class="error-text" role="alert" hidden></p>
+
+            <details id="system-details">
+              <summary>System prompt <span class="muted">(optional, sent to every model)</span></summary>
+              <textarea id="system" rows="3" placeholder="e.g. Answer in three sentences or fewer."></textarea>
+            </details>
+
+            <div class="compose-footer">
+              <span class="muted shortcut"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> to send</span>
+              <button type="submit" id="send" class="primary" disabled>Select a model</button>
+            </div>
+          </form>
+
+          <section aria-labelledby="results-heading">
+            <div class="results-head">
+              <h2 id="results-heading">Responses</h2>
+              <button type="button" id="clear-results" class="ghost small" hidden>Clear responses</button>
+            </div>
+            <p id="empty-results" class="empty">
+              Answers from each selected model will appear here as they arrive. Every prompt is also saved in History.
+            </p>
+            <div id="results" class="results" aria-live="polite"></div>
+          </section>
+        </section>
+
+        <!-- History ------------------------------------------------------- -->
+        <section id="view-history" class="view" aria-labelledby="history-heading" hidden>
+          <div class="panel history-toolbar">
+            <h2 id="history-heading" class="visually-hidden">History</h2>
+            <label for="history-search" class="visually-hidden">Search history</label>
+            <input type="search" id="history-search" placeholder="Search prompts and answers" autocomplete="off" />
+            <label for="history-source" class="visually-hidden">Source</label>
+            <select id="history-source">
+              <option value="all">All sources</option>
+              <option value="app">This app</option>
+              <option value="chatgpt">ChatGPT</option>
+              <option value="claude">Claude</option>
+              <option value="gemini">Gemini</option>
+              <option value="other">Other</option>
+            </select>
+            <span class="toolbar-spacer"></span>
+            <button type="button" id="history-import" class="ghost small">Import chats…</button>
+            <input type="file" id="history-import-input" accept=".json,.zip,application/json,application/zip" multiple hidden />
+            <button type="button" id="history-export" class="ghost small">Export history</button>
+            <span id="history-delete-slot"></span>
           </div>
-        </div>
-        <div id="provider-list" class="provider-list"></div>
-      </section>
+          <p class="muted hint history-help">
+            Import the export file from ChatGPT or Claude (the .zip, or the conversations.json inside it), Gemini from Google
+            Takeout (My Activity, JSON format), or a file from <strong>Export history</strong>.
+          </p>
+          <p id="history-status" class="status-line" role="status" hidden></p>
+          <p id="history-count" class="muted hint"></p>
+          <div class="history-layout">
+            <ol id="history-list" class="history-list" aria-label="History items"></ol>
+            <article id="history-detail" class="panel history-detail" aria-live="polite"></article>
+          </div>
+        </section>
 
-      <form id="prompt-form" class="panel compose">
-        <label for="prompt" class="field-label">Prompt</label>
-        <textarea id="prompt" rows="5" placeholder="Ask all the selected models something…"></textarea>
+        <!-- Settings ------------------------------------------------------ -->
+        <section id="view-settings" class="view" aria-label="Settings" hidden>
+          <section class="panel" aria-labelledby="keys-heading">
+            <h2 id="keys-heading">API keys</h2>
+            <div class="table-wrap">
+              <table class="settings-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Provider</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">Variable</th>
+                    <th scope="col"><span class="visually-hidden">Link</span></th>
+                  </tr>
+                </thead>
+                <tbody id="settings-keys"></tbody>
+              </table>
+            </div>
+          </section>
 
-        <details id="system-details">
-          <summary>System prompt <span class="muted">(optional, sent to every model)</span></summary>
-          <textarea id="system" rows="3" placeholder="e.g. Answer in three sentences or fewer."></textarea>
-        </details>
+          <p id="settings-locked" class="notice" hidden>
+            Settings can only be changed on the computer that runs the app. Open it there at http://127.0.0.1 to import keys.
+          </p>
 
-        <div class="compose-footer">
-          <span class="muted shortcut"><kbd>Ctrl</kbd> + <kbd>Enter</kbd> to send</span>
-          <button type="submit" id="send" class="primary" disabled>Select a model</button>
-        </div>
-      </form>
+          <section id="settings-import" class="panel" aria-labelledby="import-heading">
+            <h2 id="import-heading">Import settings</h2>
+            <p class="muted">
+              Load your API keys and default models from a <code>.env</code> file or a JSON file such as
+              <code>{"OPENAI_API_KEY": "sk-…"}</code>. They are saved in this app's <code>.env</code> file on this computer and
+              take effect right away. Keys are never shown in full.
+            </p>
+            <div class="import-actions">
+              <button type="button" id="settings-file" class="ghost">Choose settings file…</button>
+              <input type="file" id="settings-file-input" accept=".env,.json,.txt,text/plain,application/json" hidden />
+            </div>
+            <details>
+              <summary>Or paste settings</summary>
+              <label for="settings-paste" class="visually-hidden">Settings text</label>
+              <textarea id="settings-paste" rows="5" spellcheck="false" placeholder="OPENAI_API_KEY=sk-…&#10;DEEPSEEK_API_KEY=…"></textarea>
+              <button type="button" id="settings-preview-button" class="ghost small">Check pasted settings</button>
+            </details>
+            <p id="settings-status" class="status-line" role="status" hidden></p>
+            <div id="settings-preview" class="settings-preview"></div>
+          </section>
 
-      <section aria-labelledby="results-heading">
-        <div class="results-head">
-          <h2 id="results-heading">Responses</h2>
-          <button type="button" id="clear-results" class="ghost small" hidden>Clear responses</button>
-        </div>
-        <p id="empty-results" class="empty">Answers from each selected model will appear here as they arrive.</p>
-        <div id="results" class="results" aria-live="polite"></div>
-      </section>
+          <section class="panel" aria-labelledby="current-heading">
+            <h2 id="current-heading">Saved settings</h2>
+            <div id="settings-current" class="table-wrap"></div>
+          </section>
+        </section>
+      </main>
+
+      <aside id="ad-bottom" class="ad-slot" aria-label="Advertisement" hidden></aside>
     </div>
   </body>
 </html>

@@ -1,7 +1,7 @@
 {
   "name": "default-ai",
   "version": "1.0.0",
-  "description": "Send one prompt to OpenAI, Claude, Meta, Gemini and Grok at once and compare the answers.",
+  "description": "Send one prompt to OpenAI, Claude, Meta, Gemini, Grok, DeepSeek, Perplexity and Kimi at once and compare the answers.",
   "private": true,
   "type": "module",
   "main": "server.js",

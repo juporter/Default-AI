@@ -5,7 +5,14 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
+import os from 'node:os';
+import path from 'node:path';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { parseEnv } from 'node:util';
 import { createApp } from '../server.js';
+
+const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'default-ai-test-'));
+const envFile = path.join(tmpDir, '.env');
 
 let upstream;
 let app;
@@ -32,6 +39,17 @@ function fakeProvider(req, res) {
     }
     if (req.method === 'GET' && req.url.startsWith('/gemini/models')) {
       return send(200, { models: [{ name: 'models/gemini-a', supportedGenerationMethods: ['generateContent'] }] });
+    }
+    if (req.url === '/perplexity/agent') {
+      return send(200, {
+        model: json.model,
+        status: 'completed',
+        output: [
+          { type: 'search_results', results: [{ id: 1, title: 'Source A', url: 'https://a.example' }] },
+          { type: 'message', content: [{ type: 'output_text', text: `perplexity says: ${json.input}` }] },
+        ],
+        usage: { input_tokens: 13, output_tokens: 8 },
+      });
     }
     if (req.url.endsWith('/chat/completions')) {
       const prompt = json.messages.at(-1).content;
@@ -75,12 +93,18 @@ before(async () => {
       META_BASE_URL: `${up}/meta`,
       GEMINI_API_KEY: 'gemini-secret',
       GEMINI_BASE_URL: `${up}/gemini`,
-      // Grok is deliberately left unconfigured.
+      DEEPSEEK_API_KEY: 'deepseek-secret',
+      DEEPSEEK_BASE_URL: `${up}/deepseek`,
+      PERPLEXITY_API_KEY: 'pplx-secret',
+      PERPLEXITY_BASE_URL: `${up}/perplexity`,
+      MOONSHOT_API_KEY: 'kimi-secret',
+      KIMI_BASE_URL: `${up}/kimi`,
+      // Grok is deliberately left unconfigured (until the settings test adds it).
       XAI_BASE_URL: `${up}/xai`,
       REQUEST_TIMEOUT_MS: '500',
       MAX_TOKENS: '777',
     },
-    { host: '127.0.0.1' },
+    { host: '127.0.0.1', envFile },
   ).listen(0, '127.0.0.1');
   await once(app, 'listening');
   base = `http://127.0.0.1:${app.address().port}`;
@@ -89,6 +113,7 @@ before(async () => {
 after(() => {
   app.close();
   upstream.close();
+  rmSync(tmpDir, { recursive: true, force: true });
 });
 
 const chat = (body, headers = { 'content-type': 'application/json' }) =>
@@ -108,6 +133,9 @@ test('lists providers without leaking keys', async () => {
       ['meta', true],
       ['gemini', true],
       ['xai', false],
+      ['deepseek', true],
+      ['perplexity', true],
+      ['kimi', true],
     ],
   );
 });
@@ -116,6 +144,9 @@ test('sends a prompt to each configured provider and normalizes the answer', asy
   const cases = [
     ['openai', 'openai says: Hi', { input: 10, output: 5 }],
     ['meta', 'meta says: Hi', { input: 10, output: 5 }],
+    ['deepseek', 'deepseek says: Hi', { input: 10, output: 5 }],
+    ['kimi', 'kimi says: Hi', { input: 10, output: 5 }],
+    ['perplexity', 'perplexity says: Hi', { input: 13, output: 8 }],
     ['anthropic', 'claude says: Hi', { input: 11, output: 6 }],
     ['gemini', 'gemini says: Hi', { input: 12, output: 7 }],
   ];
@@ -139,6 +170,20 @@ test('sends a prompt to each configured provider and normalizes the answer', asy
   assert.equal(openaiCall.headers.authorization, 'Bearer sk-openai-secret');
   const geminiCall = seen.find((r) => r.url.startsWith('/gemini/models/test-model'));
   assert.equal(geminiCall.headers['x-goog-api-key'], 'gemini-secret');
+  const pplxCall = seen.find((r) => r.url === '/perplexity/agent');
+  assert.deepEqual(pplxCall.json.tools, [{ type: 'web_search' }]);
+  assert.equal(pplxCall.json.instructions, 'Be brief');
+  assert.equal(seen.find((r) => r.url === '/kimi/chat/completions').headers.authorization, 'Bearer kimi-secret');
+});
+
+test('returns Perplexity web sources', async () => {
+  const res = await chat({ provider: 'perplexity', prompt: 'Hi' });
+  assert.deepEqual((await res.json()).sources, [{ title: 'Source A', url: 'https://a.example' }]);
+});
+
+test('rejects oversized requests', async () => {
+  const res = await chat({ provider: 'openai', prompt: 'x'.repeat(8_100_000) });
+  assert.equal(res.status, 413);
 });
 
 test('uses the default model when none is given', async () => {
@@ -211,4 +256,115 @@ test('refuses non-loopback Host headers (DNS rebinding)', async () => {
       .on('error', reject);
   });
   assert.equal(status, 403);
+});
+
+const postJson = (url, body) =>
+  fetch(`${base}${url}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+
+test('settings: preview masks keys, apply writes .env and turns the provider on without a restart', async () => {
+  const text = `XAI_API_KEY=xai-secret-123456\nXAI_MODEL=grok-test\nHOST=0.0.0.0\n`;
+
+  let res = await postJson('/api/settings/preview', { text });
+  assert.equal(res.status, 200);
+  const preview = await res.json();
+  assert.deepEqual(
+    preview.changes.sort((a, b) => a.name.localeCompare(b.name)),
+    [
+      { name: 'XAI_API_KEY', value: '••••3456', action: 'add' },
+      { name: 'XAI_MODEL', value: 'grok-test', action: 'add' },
+    ],
+  );
+  assert.deepEqual(preview.ignored, ['HOST']);
+
+  res = await postJson('/api/settings/apply', { text });
+  assert.equal(res.status, 200);
+  const applied = await res.json();
+  const xai = applied.providers.find((p) => p.id === 'xai');
+  assert.equal(xai.configured, true);
+  assert.equal(xai.defaultModel, 'grok-test');
+  assert.ok(!JSON.stringify(applied).includes('xai-secret'));
+  assert.deepEqual(parseEnv(readFileSync(envFile, 'utf8')), { XAI_API_KEY: 'xai-secret-123456', XAI_MODEL: 'grok-test' });
+
+  res = await chat({ provider: 'xai', prompt: 'Hi' });
+  assert.equal((await res.json()).text, 'xai says: Hi');
+
+  res = await fetch(`${base}/api/settings`);
+  const { variables } = await res.json();
+  assert.deepEqual(variables.find((v) => v.name === 'XAI_API_KEY'), { name: 'XAI_API_KEY', set: true, value: '••••3456' });
+  assert.ok(!JSON.stringify(variables).includes('secret'));
+});
+
+test('settings: invalid files are refused and nothing is written', async () => {
+  const before = readFileSync(envFile, 'utf8');
+  let res = await postJson('/api/settings/apply', { text: 'OPENAI_BASE_URL=ftp://evil\n' });
+  assert.equal(res.status, 400);
+  res = await postJson('/api/settings/apply', { text: 'NOTHING_USEFUL=1\n' });
+  assert.equal(res.status, 400);
+  assert.equal(readFileSync(envFile, 'utf8'), before);
+});
+
+test('settings: refused from another computer', async (t) => {
+  const lan = Object.values(os.networkInterfaces())
+    .flat()
+    .find((i) => i && i.family === 'IPv4' && !i.internal);
+  if (!lan) return t.skip('no network interface besides loopback');
+  const remoteApp = createApp({}, { host: '0.0.0.0', envFile }).listen(0, '0.0.0.0');
+  await once(remoteApp, 'listening');
+  try {
+    const url = `http://${lan.address}:${remoteApp.address().port}`;
+    let res = await fetch(`${url}/api/settings`);
+    assert.equal(res.status, 403);
+    res = await fetch(`${url}/api/settings/apply`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text: 'OPENAI_API_KEY=attacker' }),
+    });
+    assert.equal(res.status, 403);
+    // The rest of the app still works for other computers.
+    res = await fetch(`${url}/api/providers`);
+    assert.equal(res.status, 200);
+  } finally {
+    remoteApp.close();
+  }
+});
+
+test('ads: off by default, strict CSP, no ads.txt', async () => {
+  let res = await fetch(`${base}/api/config`);
+  assert.equal((await res.json()).ads.enabled, false);
+  res = await fetch(`${base}/`);
+  assert.match(res.headers.get('content-security-policy'), /default-src 'self'/);
+  assert.equal((await fetch(`${base}/ads.txt`)).status, 404);
+});
+
+test('ads: AdSense on adds a nonce to scripts, Google strict CSP and ads.txt', async () => {
+  const adsApp = createApp(
+    { ADSENSE_CLIENT: 'ca-pub-1234567890123456', ADSENSE_SLOT_TOP: '1111111111' },
+    { host: '127.0.0.1', envFile },
+  ).listen(0, '127.0.0.1');
+  await once(adsApp, 'listening');
+  try {
+    const url = `http://127.0.0.1:${adsApp.address().port}`;
+    let res = await fetch(`${url}/`);
+    const csp = res.headers.get('content-security-policy');
+    const nonce = csp.match(/'nonce-([^']+)'/)[1];
+    assert.match(csp, /'strict-dynamic'/);
+    assert.match(csp, /object-src 'none'/);
+    const html = await res.text();
+    assert.ok(html.includes(`<script nonce="${nonce}" `));
+    // A fresh nonce for every page load.
+    const again = (await fetch(`${url}/`)).headers.get('content-security-policy');
+    assert.notEqual(again, csp);
+
+    res = await fetch(`${url}/ads.txt`);
+    assert.equal(await res.text(), 'google.com, pub-1234567890123456, DIRECT, f08c47fec0942fa0\n');
+    res = await fetch(`${url}/api/config`);
+    assert.deepEqual((await res.json()).ads, {
+      enabled: true,
+      client: 'ca-pub-1234567890123456',
+      slots: { top: '1111111111', bottom: '' },
+      placeholder: false,
+    });
+  } finally {
+    adsApp.close();
+  }
 });

@@ -9,6 +9,12 @@
 const OPENAI_NON_CHAT =
   /(embed|whisper|tts|dall-e|davinci|babbage|moderation|transcribe|realtime|audio|image|search|computer-use|sora)/i;
 
+// `api` picks the wire format:
+//   openai      Chat Completions (OpenAI, Meta, Grok, DeepSeek, Kimi)
+//   anthropic   Anthropic Messages API
+//   gemini      Google generateContent
+//   perplexity  Perplexity Agent API (Responses format, with web search)
+// `models` are suggestions shown when the provider's live model list can't be loaded.
 export const PROVIDERS = [
   {
     id: 'openai',
@@ -20,6 +26,7 @@ export const PROVIDERS = [
     baseUrl: 'https://api.openai.com/v1',
     modelEnv: 'OPENAI_MODEL',
     defaultModel: 'gpt-6-astra',
+    models: ['gpt-6-astra', 'gpt-6.1-terra', 'gpt-6-luna'],
     keyUrl: 'https://platform.openai.com/api-keys',
     modelFilter: (id) => !OPENAI_NON_CHAT.test(id),
   },
@@ -33,6 +40,7 @@ export const PROVIDERS = [
     baseUrl: 'https://api.anthropic.com',
     modelEnv: 'ANTHROPIC_MODEL',
     defaultModel: 'claude-opus-5-5',
+    models: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'],
     keyUrl: 'https://console.anthropic.com/settings/keys',
   },
   {
@@ -45,6 +53,7 @@ export const PROVIDERS = [
     baseUrl: 'https://api.meta.ai/v1',
     modelEnv: 'META_MODEL',
     defaultModel: 'muse-spark-1.3',
+    models: ['muse-spark-1.3', 'muse-wonder-1.0'],
     keyUrl: 'https://dev.meta.ai/',
   },
   {
@@ -57,6 +66,7 @@ export const PROVIDERS = [
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
     modelEnv: 'GEMINI_MODEL',
     defaultModel: 'gemini-4-argon',
+    models: ['gemini-4-argon', 'gemini-3.8-flash', 'gemini-3.5-flash-lite'],
     keyUrl: 'https://aistudio.google.com/apikey',
   },
   {
@@ -69,9 +79,59 @@ export const PROVIDERS = [
     baseUrl: 'https://api.x.ai/v1',
     modelEnv: 'XAI_MODEL',
     defaultModel: 'grok-4.7',
+    models: ['grok-4.7', 'grok-4.3'],
     keyUrl: 'https://console.x.ai/',
   },
+  {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    vendor: 'DeepSeek',
+    api: 'openai',
+    keyEnv: ['DEEPSEEK_API_KEY'],
+    baseUrlEnv: 'DEEPSEEK_BASE_URL',
+    baseUrl: 'https://api.deepseek.com',
+    modelEnv: 'DEEPSEEK_MODEL',
+    defaultModel: 'deepseek-v4-pro',
+    models: ['deepseek-v4-pro', 'deepseek-flash'],
+    keyUrl: 'https://platform.deepseek.com/api_keys',
+  },
+  {
+    id: 'perplexity',
+    name: 'Perplexity',
+    vendor: 'Perplexity',
+    api: 'perplexity',
+    keyEnv: ['PERPLEXITY_API_KEY'],
+    baseUrlEnv: 'PERPLEXITY_BASE_URL',
+    baseUrl: 'https://api.perplexity.ai/v1',
+    modelEnv: 'PERPLEXITY_MODEL',
+    defaultModel: 'perplexity/sonar',
+    models: ['perplexity/sonar', 'perplexity/glm-5.3-flash'],
+    keyUrl: 'https://console.perplexity.ai/',
+  },
+  {
+    id: 'kimi',
+    name: 'Kimi',
+    vendor: 'Moonshot AI',
+    api: 'openai',
+    keyEnv: ['KIMI_API_KEY', 'MOONSHOT_API_KEY'],
+    baseUrlEnv: 'KIMI_BASE_URL',
+    baseUrl: 'https://api.moonshot.ai/v1',
+    modelEnv: 'KIMI_MODEL',
+    defaultModel: 'kimi-k3.1-pro',
+    models: ['kimi-k3.1-pro', 'kimi-k3.1-pro-highspeed', 'kimi-k3'],
+    keyUrl: 'https://platform.kimi.ai/console/api-keys',
+  },
 ];
+
+/** Every provider-related variable name (keys, models, base URLs). */
+export function providerVariables() {
+  return PROVIDERS.flatMap((p) => [...p.keyEnv, p.modelEnv, p.baseUrlEnv]);
+}
+
+/** True for variables that hold a secret and must be masked when shown. */
+export function isSecretVariable(name) {
+  return PROVIDERS.some((p) => p.keyEnv.includes(name));
+}
 
 /**
  * Resolve each provider against an environment object (normally process.env).
@@ -97,6 +157,7 @@ export function publicInfo(p) {
     vendor: p.vendor,
     configured: Boolean(p.apiKey),
     defaultModel: p.defaultModel,
+    models: p.models,
     keyEnv: p.keyEnv[0],
     keyUrl: p.keyUrl,
   };
@@ -152,8 +213,30 @@ export function buildChatRequest(p, { model, prompt, system, maxTokens }) {
         },
       };
 
+    case 'perplexity':
+      // Perplexity's Agent API. Web search is opt-in, so always turn it on:
+      // grounded, cited answers are the reason to pick Perplexity.
+      return {
+        url: `${p.baseUrl}/agent`,
+        init: {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            authorization: `Bearer ${p.apiKey}`,
+          },
+          body: JSON.stringify({
+            model,
+            input: prompt,
+            ...(system ? { instructions: system } : {}),
+            tools: [{ type: 'web_search' }],
+            // The Agent API requires an output limit for anthropic/* models.
+            ...(model.startsWith('anthropic/') ? { max_output_tokens: maxTokens } : {}),
+          }),
+        },
+      };
+
     case 'openai':
-      // OpenAI, xAI and Meta's Model API all speak the Chat Completions format.
+      // OpenAI, xAI, Meta, DeepSeek and Kimi all speak the Chat Completions format.
       // No temperature / max_tokens: several current reasoning models reject them.
       return {
         url: `${p.baseUrl}/chat/completions`,
@@ -180,7 +263,7 @@ export function buildChatRequest(p, { model, prompt, system, maxTokens }) {
 
 /**
  * Normalize a successful chat response.
- * @returns {{text: string, model: string|undefined, usage: {input?: number, output?: number}, stopReason?: string}}
+ * @returns {{text: string, model: string|undefined, usage: {input?: number, output?: number}, stopReason?: string, sources?: {title: string, url: string}[]}}
  */
 export function parseChatResponse(p, json) {
   switch (p.api) {
@@ -217,19 +300,59 @@ export function parseChatResponse(p, json) {
       };
     }
 
+    case 'perplexity': {
+      if (json.error?.message) throw new Error(json.error.message);
+      const output = Array.isArray(json.output) ? json.output : [];
+      const text = output
+        .filter((item) => item.type === 'message')
+        .flatMap((item) => item.content || [])
+        .filter((part) => part.type === 'output_text' && typeof part.text === 'string')
+        .map((part) => part.text)
+        .join('');
+      const results = output.filter((item) => item.type === 'search_results').flatMap((item) => item.results || []);
+      return {
+        text,
+        model: json.model,
+        usage: { input: json.usage?.input_tokens, output: json.usage?.output_tokens },
+        stopReason: json.status === 'incomplete' ? 'max_tokens' : undefined,
+        sources: cleanSources(results.map((r) => ({ title: r.title, url: r.url }))),
+      };
+    }
+
     case 'openai': {
       const choice = json.choices?.[0];
+      // Some compatible APIs return web citations as url_citation annotations.
+      const annotations = Array.isArray(choice?.message?.annotations) ? choice.message.annotations : [];
+      const sources = cleanSources(
+        annotations
+          .filter((a) => a?.type === 'url_citation')
+          .map((a) => ({ title: a.url_citation?.title, url: a.url_citation?.url })),
+      );
       return {
         text: contentToText(choice?.message?.content),
         model: json.model,
         usage: { input: json.usage?.prompt_tokens, output: json.usage?.completion_tokens },
         stopReason: choice?.finish_reason,
+        ...(sources.length ? { sources } : {}),
       };
     }
 
     default:
       throw new Error(`Unknown provider api: ${p.api}`);
   }
+}
+
+/** Keep only http(s) links, de-duplicated, with a readable title. */
+function cleanSources(list) {
+  const seen = new Set();
+  const out = [];
+  for (const s of list) {
+    if (typeof s?.url !== 'string' || !/^https?:\/\//i.test(s.url) || seen.has(s.url)) continue;
+    seen.add(s.url);
+    const title = typeof s.title === 'string' && s.title.trim() ? s.title.trim() : s.url;
+    out.push({ title, url: s.url });
+  }
+  return out;
 }
 
 // Chat Completions content is usually a string, but some compatible APIs
@@ -262,6 +385,7 @@ export function buildModelsRequest(p) {
         init: { headers: { 'x-goog-api-key': p.apiKey } },
       };
     case 'openai':
+    case 'perplexity':
       return {
         url: `${p.baseUrl}/models`,
         init: { headers: { authorization: `Bearer ${p.apiKey}` } },

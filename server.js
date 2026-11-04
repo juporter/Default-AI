@@ -4,16 +4,22 @@
 // Serves the web UI from ./public and proxies prompts to each provider so the
 // API keys stay on the server and are never sent to the browser.
 //
-//   GET  /api/providers           which providers exist / are configured
-//   GET  /api/models?provider=id  live model list from the provider
-//   POST /api/chat                {provider, model, prompt, system} -> answer
+//   GET  /api/providers              which providers exist / are configured
+//   GET  /api/models?provider=id     live model list from the provider
+//   POST /api/chat                   {provider, model, prompt, system} -> answer
+//   GET  /api/config                 page settings (ad slots)
+//   GET  /api/settings               current settings, secrets masked   (this computer only)
+//   POST /api/settings/preview       {text} -> what a settings file would change (this computer only)
+//   POST /api/settings/apply         {text} -> write .env and reload    (this computer only)
+//   GET  /ads.txt                    AdSense ads.txt, when ADSENSE_CLIENT is set
 
 import http from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile, rename } from 'node:fs/promises';
 import path from 'node:path';
-import { parseEnv } from 'node:util';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { parseEnv } from 'node:util';
 import {
   resolveProviders,
   publicInfo,
@@ -23,10 +29,13 @@ import {
   parseModelsResponse,
   extractErrorMessage,
 } from './providers.js';
+import { allowedVariables, parseSettingsText, maskValue, mergeEnvText, adsConfig } from './settings.js';
 
 const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(APP_DIR, 'public');
-const MAX_BODY_BYTES = 1_000_000;
+const DEFAULT_ENV_FILE = path.join(APP_DIR, '.env');
+// Large enough for a prompt with attached files (the browser caps attachments at 2 MB).
+const MAX_BODY_BYTES = 8_000_000;
 const MODEL_CACHE_MS = 10 * 60 * 1000;
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
 
@@ -38,12 +47,20 @@ const CONTENT_TYPES = {
   '.json': 'application/json; charset=utf-8',
 };
 
-const SECURITY_HEADERS = {
+const BASE_HEADERS = {
   'x-content-type-options': 'nosniff',
-  'referrer-policy': 'no-referrer',
-  'content-security-policy':
-    "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+  'referrer-policy': 'strict-origin-when-cross-origin',
 };
+
+// Without ads everything comes from this server.
+const STRICT_CSP =
+  "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
+
+// With AdSense on, Google supports only its nonce-based "strict CSP":
+// https://support.google.com/adsense/answer/16283098
+const adsCsp = (nonce) =>
+  `object-src 'none'; script-src 'nonce-${nonce}' 'unsafe-inline' 'unsafe-eval' 'strict-dynamic' https: http:; ` +
+  "base-uri 'none'; frame-ancestors 'none'; form-action 'none'";
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -54,16 +71,28 @@ class HttpError extends Error {
 
 /**
  * Create the HTTP server (not yet listening).
- * @param {Record<string, string|undefined>} env  usually process.env
- * @param {{fetchImpl?: typeof fetch, host?: string}} [options]
+ * @param {Record<string, string|undefined>} env  usually process.env plus .env
+ * @param {{fetchImpl?: typeof fetch, host?: string, envFile?: string}} [options]
  */
-export function createApp(env = process.env, { fetchImpl = fetch, host = env.HOST || '127.0.0.1' } = {}) {
-  const providers = resolveProviders(env);
-  const byId = new Map(providers.map((p) => [p.id, p]));
-  const maxTokens = positiveInt(env.MAX_TOKENS, 4096);
-  const timeoutMs = positiveInt(env.REQUEST_TIMEOUT_MS, 120_000);
-  const checkHost = LOOPBACK_HOSTS.has(host);
+export function createApp(
+  initialEnv = process.env,
+  { fetchImpl = fetch, host = initialEnv.HOST || '127.0.0.1', envFile = DEFAULT_ENV_FILE } = {},
+) {
+  // Settings can change at runtime (Settings → Import), so keep them mutable.
+  const env = { ...initialEnv };
+  let providers;
+  let byId;
   const modelCache = new Map();
+  const reload = () => {
+    providers = resolveProviders(env);
+    byId = new Map(providers.map((p) => [p.id, p]));
+    modelCache.clear();
+  };
+  reload();
+
+  const maxTokens = () => positiveInt(env.MAX_TOKENS, 4096);
+  const timeoutMs = () => positiveInt(env.REQUEST_TIMEOUT_MS, 120_000);
+  const checkHost = LOOPBACK_HOSTS.has(host);
 
   async function upstream(url, init, signal) {
     const res = await fetchImpl(url, { ...init, signal });
@@ -80,7 +109,7 @@ export function createApp(env = process.env, { fetchImpl = fetch, host = env.HOS
     const p = byId.get(id);
     if (!p) throw new HttpError(400, `Unknown provider: ${id}`);
     if (!p.apiKey) {
-      throw new HttpError(400, `${p.name} is not configured. Set ${p.keyEnv[0]} in .env and restart the server.`);
+      throw new HttpError(400, `${p.name} is not configured. Set ${p.keyEnv[0]} in .env or import a settings file.`);
     }
     return p;
   }
@@ -95,9 +124,20 @@ export function createApp(env = process.env, { fetchImpl = fetch, host = env.HOS
     if (model.length > 200) throw new HttpError(400, 'Model ID is too long');
 
     const started = performance.now();
-    const { url, init } = buildChatRequest(p, { model, prompt, system, maxTokens });
-    const json = await upstream(url, init, requestSignal(res, timeoutMs));
-    const result = parseChatResponse(p, json);
+    const { url, init } = buildChatRequest(p, { model, prompt, system, maxTokens: maxTokens() });
+    let json;
+    try {
+      json = await upstream(url, init, requestSignal(res, timeoutMs()));
+    } catch (err) {
+      if (err.name === 'TimeoutError') throw new HttpError(504, 'The provider did not answer in time (see REQUEST_TIMEOUT_MS)');
+      throw err;
+    }
+    let result;
+    try {
+      result = parseChatResponse(p, json);
+    } catch (err) {
+      throw new HttpError(502, err.message);
+    }
     sendJson(res, 200, {
       ...result,
       model: result.model || model,
@@ -112,10 +152,91 @@ export function createApp(env = process.env, { fetchImpl = fetch, host = env.HOS
       return sendJson(res, 200, { models: cached.models });
     }
     const { url, init } = buildModelsRequest(p);
-    const json = await upstream(url, init, requestSignal(res, 30_000));
+    let json;
+    try {
+      json = await upstream(url, init, requestSignal(res, 30_000));
+    } catch (err) {
+      if (err.name === 'TimeoutError') throw new HttpError(504, 'The provider did not list its models in time');
+      throw err;
+    }
     const models = parseModelsResponse(p, json);
     modelCache.set(p.id, { at: Date.now(), models });
     sendJson(res, 200, { models });
+  }
+
+  // --- Settings import (only from the computer running the app) -------------
+
+  function requireLocal(req) {
+    if (!isLoopbackAddress(req.socket.remoteAddress)) {
+      throw new HttpError(403, 'Settings can only be changed on the computer that runs the app.');
+    }
+  }
+
+  function settingsSummary() {
+    return allowedVariables().map((name) => ({
+      name,
+      set: Boolean(env[name]),
+      value: maskValue(name, env[name] || ''),
+    }));
+  }
+
+  function preview(text) {
+    const { changes, ignored, errors } = parseSettingsText(text);
+    return {
+      changes: changes.map(({ name, value }) => ({
+        name,
+        value: maskValue(name, value),
+        action: value === '' ? 'clear' : env[name] ? 'replace' : 'add',
+      })),
+      ignored,
+      errors,
+    };
+  }
+
+  async function applySettings(text) {
+    const { changes, errors } = parseSettingsText(text);
+    if (errors.length) throw new HttpError(400, errors.join(' '));
+    if (!changes.length) throw new HttpError(400, 'The file has no settings this app uses.');
+
+    let existing = '';
+    try {
+      existing = await readFile(envFile, 'utf8');
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err;
+    }
+    const tmp = `${envFile}.${process.pid}.tmp`;
+    await writeFile(tmp, mergeEnvText(existing, changes), { mode: 0o600 });
+    await rename(tmp, envFile);
+
+    for (const { name, value } of changes) env[name] = value;
+    reload();
+    return changes.map((c) => c.name);
+  }
+
+  // --- Pages ----------------------------------------------------------------
+
+  async function serveIndex(req, res) {
+    const ads = adsConfig(env);
+    const nonce = randomBytes(16).toString('base64');
+    let html = await readFile(path.join(PUBLIC_DIR, 'index.html'), 'utf8');
+    if (ads.enabled) html = html.replaceAll('<script ', `<script nonce="${nonce}" `);
+    const body = Buffer.from(html);
+    res.writeHead(200, {
+      'content-type': CONTENT_TYPES['.html'],
+      'content-length': body.length,
+      'cache-control': 'no-store',
+      'content-security-policy': ads.enabled ? adsCsp(nonce) : STRICT_CSP,
+      ...BASE_HEADERS,
+    });
+    res.end(req.method === 'HEAD' ? undefined : body);
+  }
+
+  function serveAdsTxt(res) {
+    const ads = adsConfig(env);
+    if (!ads.enabled) throw new HttpError(404, 'Not found');
+    const body = `google.com, ${ads.client.replace(/^ca-/, '')}, DIRECT, f08c47fec0942fa0\n`;
+    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-cache', ...BASE_HEADERS });
+    res.end(body);
   }
 
   return http.createServer(async (req, res) => {
@@ -128,27 +249,44 @@ export function createApp(env = process.env, { fetchImpl = fetch, host = env.HOS
       const url = new URL(req.url, 'http://localhost');
       const route = `${req.method} ${url.pathname}`;
 
-      if (route === 'GET /api/providers') {
-        return sendJson(res, 200, { providers: providers.map(publicInfo) });
+      switch (route) {
+        case 'GET /api/providers':
+          return sendJson(res, 200, { providers: providers.map(publicInfo) });
+        case 'GET /api/models':
+          return await handleModels(res, url.searchParams.get('provider'));
+        case 'POST /api/chat':
+          return await handleChat(req, res);
+        case 'GET /api/config':
+          return sendJson(res, 200, { ads: adsConfig(env) });
+        case 'GET /api/settings':
+          requireLocal(req);
+          return sendJson(res, 200, { variables: settingsSummary() });
+        case 'POST /api/settings/preview': {
+          requireLocal(req);
+          const { text } = await readJson(req);
+          return sendJson(res, 200, preview(text));
+        }
+        case 'POST /api/settings/apply': {
+          requireLocal(req);
+          const { text } = await readJson(req);
+          const applied = await applySettings(text);
+          return sendJson(res, 200, { applied, providers: providers.map(publicInfo), ads: adsConfig(env) });
+        }
+        case 'GET /ads.txt':
+        case 'HEAD /ads.txt':
+          return serveAdsTxt(res);
+        case 'GET /':
+        case 'HEAD /':
+        case 'GET /index.html':
+        case 'HEAD /index.html':
+          return await serveIndex(req, res);
       }
-      if (route === 'GET /api/models') {
-        return await handleModels(res, url.searchParams.get('provider'));
-      }
-      if (route === 'POST /api/chat') {
-        return await handleChat(req, res);
-      }
-      if (url.pathname.startsWith('/api/')) {
-        throw new HttpError(404, 'Not found');
-      }
-      if (req.method === 'GET' || req.method === 'HEAD') {
-        return await serveStatic(req, res, url.pathname);
-      }
+
+      if (url.pathname.startsWith('/api/')) throw new HttpError(404, 'Not found');
+      if (req.method === 'GET' || req.method === 'HEAD') return await serveStatic(req, res, url.pathname);
       throw new HttpError(405, 'Method not allowed');
     } catch (err) {
       if (res.headersSent || res.destroyed) return;
-      if (err.name === 'TimeoutError') {
-        return sendJson(res, 504, { error: 'The provider did not answer in time (see REQUEST_TIMEOUT_MS)' });
-      }
       if (err.name === 'AbortError') return; // the browser went away
       if (err instanceof HttpError) return sendJson(res, err.status, { error: err.message });
       console.error(err);
@@ -176,7 +314,7 @@ async function readJson(req) {
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > MAX_BODY_BYTES) throw new HttpError(413, 'Request body too large');
+    if (size > MAX_BODY_BYTES) throw new HttpError(413, 'Request is too large. Attach smaller files.');
     chunks.push(chunk);
   }
   try {
@@ -195,7 +333,6 @@ async function serveStatic(req, res, pathname) {
   } catch {
     throw new HttpError(400, 'Bad path');
   }
-  if (rel === '/') rel = '/index.html';
   const filePath = path.join(PUBLIC_DIR, path.normalize(rel));
   if (!filePath.startsWith(PUBLIC_DIR + path.sep)) throw new HttpError(404, 'Not found');
 
@@ -209,7 +346,7 @@ async function serveStatic(req, res, pathname) {
     'content-type': CONTENT_TYPES[path.extname(filePath)] || 'application/octet-stream',
     'content-length': data.length,
     'cache-control': 'no-cache',
-    ...SECURITY_HEADERS,
+    ...BASE_HEADERS,
   });
   res.end(req.method === 'HEAD' ? undefined : data);
 }
@@ -220,7 +357,7 @@ function sendJson(res, status, value) {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(body),
     'cache-control': 'no-store',
-    ...SECURITY_HEADERS,
+    ...BASE_HEADERS,
   });
   res.end(body);
 }
@@ -229,6 +366,10 @@ function hostname(hostHeader = '') {
   // "localhost:3000" -> "localhost", "[::1]:3000" -> "[::1]"
   const match = hostHeader.match(/^(\[[^\]]+\]|[^:]+)/);
   return match ? match[1].toLowerCase() : '';
+}
+
+function isLoopbackAddress(address = '') {
+  return address === '::1' || /^(::ffff:)?127\./.test(address);
 }
 
 function positiveInt(value, fallback) {
@@ -248,7 +389,7 @@ function positiveInt(value, fallback) {
 function loadEnv() {
   let fromFile = {};
   try {
-    fromFile = parseEnv(readFileSync(path.join(APP_DIR, '.env'), 'utf8'));
+    fromFile = parseEnv(readFileSync(DEFAULT_ENV_FILE, 'utf8'));
   } catch (err) {
     if (err.code !== 'ENOENT') throw err;
   }
@@ -272,10 +413,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     for (const p of resolveProviders(env)) {
       console.log(
         p.apiKey
-          ? `  ✓ ${p.name.padEnd(8)} ${p.defaultModel}`
-          : `  ✗ ${p.name.padEnd(8)} not configured (set ${p.keyEnv[0]})`,
+          ? `  ✓ ${p.name.padEnd(10)} ${p.defaultModel}`
+          : `  ✗ ${p.name.padEnd(10)} not configured (set ${p.keyEnv[0]})`,
       );
     }
+    const ads = adsConfig(env);
+    if (ads.enabled) console.log(`\n  Ads: AdSense ${ads.client}`);
     console.log('');
   });
 }
