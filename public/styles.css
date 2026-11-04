@@ -386,11 +386,13 @@ button.small {
   min-width: 0;
 }
 
+/* On its own line, so a long company name never runs under the status badge. */
 .provider-vendor {
+  display: block;
   font-weight: 400;
   color: var(--muted);
-  font-size: 0.85rem;
-  margin-left: 6px;
+  font-size: 0.78rem;
+  line-height: 1.3;
 }
 
 .status {
