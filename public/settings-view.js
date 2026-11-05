@@ -177,7 +177,7 @@ async function apply() {
     `Saved ${data.applied.length} setting${data.applied.length === 1 ? '' : 's'}. ` +
       (ready.length ? `Ready: ${ready.join(', ')}.` : 'No providers have keys yet.'),
   );
-  deps.onApplied({ providers: data.providers, adsChanged: JSON.stringify(data.ads) !== before });
+  deps.onApplied({ providers: data.providers, adsChanged: JSON.stringify(data.ads) !== before, billing: data.billing });
   renderKeys();
   await loadCurrent();
 }

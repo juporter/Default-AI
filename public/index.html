@@ -19,6 +19,7 @@
           <a href="#compare" id="nav-compare">Compare</a>
           <a href="#history" id="nav-history">History</a>
           <a href="#settings" id="nav-settings">Settings</a>
+          <a href="#account" id="nav-account" hidden>Account <span id="nav-balance" class="nav-balance"></span></a>
         </nav>
       </header>
 
@@ -155,6 +156,52 @@
           <section class="panel" aria-labelledby="current-heading">
             <h2 id="current-heading">Saved settings</h2>
             <div id="settings-current" class="table-wrap"></div>
+          </section>
+        </section>
+
+        <!-- Account (only when billing is on) ------------------------------ -->
+        <section id="view-account" class="view" aria-label="Account" hidden>
+          <p id="account-status" class="status-line" role="status" hidden></p>
+
+          <form id="account-signin" class="panel account-form" hidden>
+            <h2>Sign in</h2>
+            <p class="muted">You pay only for the tokens you use. Create an account, add credit, and each answer is charged from your balance.</p>
+            <label for="account-email" class="field-label">Email</label>
+            <input type="email" id="account-email" autocomplete="email" required />
+            <label for="account-password" class="field-label">Password</label>
+            <input type="password" id="account-password" autocomplete="current-password" minlength="8" required />
+            <p id="account-error" class="error-text" role="alert" hidden></p>
+            <div class="account-actions">
+              <button type="submit" id="account-login" class="primary">Sign in</button>
+              <button type="button" id="account-signup" class="ghost">Create account</button>
+            </div>
+          </form>
+
+          <div id="account-signed-in" class="view" hidden>
+            <section class="panel" aria-labelledby="balance-heading">
+              <div class="panel-head">
+                <h2 id="balance-heading">Balance</h2>
+                <div class="panel-actions">
+                  <span id="account-email-label" class="muted"></span>
+                  <button type="button" id="account-logout" class="ghost small">Sign out</button>
+                </div>
+              </div>
+              <p id="account-balance" class="balance"></p>
+              <p class="muted">Add credit. You'll pay on Stripe's secure checkout page and come straight back.</p>
+              <div id="account-topups" class="account-actions"></div>
+            </section>
+
+            <section class="panel" aria-labelledby="usage-heading">
+              <h2 id="usage-heading">Usage</h2>
+              <div id="account-usage" class="table-wrap"></div>
+            </section>
+
+          </div>
+
+          <section class="panel" aria-labelledby="prices-heading">
+            <h2 id="prices-heading">Prices</h2>
+            <p class="muted">Per million tokens. Input is your prompt and files, output is the answer.</p>
+            <div id="account-prices" class="table-wrap"></div>
           </section>
         </section>
       </main>

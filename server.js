@@ -12,6 +12,15 @@
 //   POST /api/settings/preview       {text} -> what a settings file would change (this computer only)
 //   POST /api/settings/apply         {text} -> write .env and reload    (this computer only)
 //   GET  /ads.txt                    AdSense ads.txt, when ADSENSE_CLIENT is set
+//
+// Billing (only when STRIPE_SECRET_KEY is set, see billing.js):
+//   POST /api/auth/signup            {email, password} -> signed in
+//   POST /api/auth/login             {email, password} -> signed in
+//   POST /api/auth/logout
+//   GET  /api/account                balance, recent usage and payments
+//   POST /api/billing/checkout       {cents} -> {url} of a Stripe Checkout page
+//   POST /api/billing/confirm        {session} -> credit a finished Checkout
+//   POST /api/billing/webhook        Stripe webhook (checkout.session.completed)
 
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
@@ -30,10 +39,30 @@ import {
   extractErrorMessage,
 } from './providers.js';
 import { allowedVariables, parseSettingsText, maskValue, mergeEnvText, adsConfig } from './settings.js';
+import {
+  billingConfig,
+  parsePricing,
+  priceFor,
+  pricingList,
+  costMicros,
+  estimateTokens,
+  BillingStore,
+  verifyPassword,
+  EMAIL_RE,
+  SESSION_COOKIE,
+  createCheckoutSession,
+  getCheckoutSession,
+  paidCredit,
+  verifyStripeSignature,
+} from './billing.js';
 
 const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(APP_DIR, 'public');
 const DEFAULT_ENV_FILE = path.join(APP_DIR, '.env');
+const DEFAULT_PRICING_FILE = path.join(APP_DIR, 'pricing.json');
+const DEFAULT_BILLING_FILE = path.join(APP_DIR, 'data', 'billing.json');
+const AUTH_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_MAX_ATTEMPTS = 10;
 // Large enough for a prompt with attached files (the browser caps attachments at 2 MB).
 const MAX_BODY_BYTES = 8_000_000;
 const MODEL_CACHE_MS = 10 * 60 * 1000;
@@ -72,21 +101,42 @@ class HttpError extends Error {
 /**
  * Create the HTTP server (not yet listening).
  * @param {Record<string, string|undefined>} env  usually process.env plus .env
- * @param {{fetchImpl?: typeof fetch, host?: string, envFile?: string}} [options]
+ * @param {{fetchImpl?: typeof fetch, host?: string, envFile?: string, pricingFile?: string, billingFile?: string}} [options]
  */
 export function createApp(
   initialEnv = process.env,
-  { fetchImpl = fetch, host = initialEnv.HOST || '127.0.0.1', envFile = DEFAULT_ENV_FILE } = {},
+  {
+    fetchImpl = fetch,
+    host = initialEnv.HOST || '127.0.0.1',
+    envFile = DEFAULT_ENV_FILE,
+    pricingFile = initialEnv.PRICING_FILE || DEFAULT_PRICING_FILE,
+    billingFile = initialEnv.BILLING_DATA_FILE || DEFAULT_BILLING_FILE,
+  } = {},
 ) {
   // Settings can change at runtime (Settings → Import), so keep them mutable.
   const env = { ...initialEnv };
   let providers;
   let byId;
   const modelCache = new Map();
+  let billing;
+  let pricing = new Map();
+  let pricingError = '';
+  const store = new BillingStore(billingFile);
+  const authAttempts = new Map(); // ip -> {count, since}
   const reload = () => {
     providers = resolveProviders(env);
     byId = new Map(providers.map((p) => [p.id, p]));
     modelCache.clear();
+    billing = billingConfig(env);
+    pricing = new Map();
+    pricingError = '';
+    if (billing.enabled) {
+      try {
+        pricing = parsePricing(readFileSync(pricingFile, 'utf8'));
+      } catch (err) {
+        pricingError = err.code === 'ENOENT' ? `${path.basename(pricingFile)} not found` : err.message;
+      }
+    }
   };
   reload();
 
@@ -116,12 +166,20 @@ export function createApp(
 
   async function handleChat(req, res) {
     const input = await readJson(req);
+    const user = billing.enabled ? await requireUser(req) : null;
     const p = requireProvider(input.provider);
     const prompt = typeof input.prompt === 'string' ? input.prompt : '';
     if (!prompt.trim()) throw new HttpError(400, 'Prompt is empty');
     const system = typeof input.system === 'string' ? input.system.trim() : '';
     const model = (typeof input.model === 'string' && input.model.trim()) || p.defaultModel;
     if (model.length > 200) throw new HttpError(400, 'Model ID is too long');
+
+    let price = null;
+    if (user) {
+      price = priceFor(pricing, p.id, model);
+      if (!price) throw new HttpError(400, `${model} has no price set, so it can't be used yet. Choose another model.`);
+      if (user.balance <= 0) throw new HttpError(402, 'Your balance is used up. Add credit under Account to keep going.');
+    }
 
     const started = performance.now();
     const { url, init } = buildChatRequest(p, { model, prompt, system, maxTokens: maxTokens() });
@@ -138,11 +196,175 @@ export function createApp(
     } catch (err) {
       throw new HttpError(502, err.message);
     }
+    let charge = {};
+    if (user) {
+      // Bill the model we asked for: that's the one with a price, even if the
+      // provider reports a dated variant of it.
+      const reported = Number.isFinite(result.usage?.input) && Number.isFinite(result.usage?.output);
+      const tokens = reported
+        ? { input: result.usage.input, output: result.usage.output }
+        : { input: estimateTokens(system + prompt), output: estimateTokens(result.text) };
+      const cost = costMicros(price, tokens, billing.markupPercent);
+      const balance = await store.charge(user.id, {
+        provider: p.id,
+        model,
+        input: tokens.input,
+        output: tokens.output,
+        estimated: !reported,
+        cost,
+      });
+      charge = { cost, balance };
+    }
     sendJson(res, 200, {
       ...result,
       model: result.model || model,
       latencyMs: Math.round(performance.now() - started),
+      ...charge,
     });
+  }
+
+  // --- Billing: accounts, credit and Stripe ----------------------------------
+
+  function requireBilling() {
+    if (!billing.enabled) throw new HttpError(404, 'Billing is not turned on');
+  }
+
+  async function currentUser(req) {
+    return store.userForToken(readCookie(req, SESSION_COOKIE));
+  }
+
+  async function requireUser(req) {
+    const user = await currentUser(req);
+    if (!user) throw new HttpError(401, 'Sign in under Account to send prompts.');
+    return user;
+  }
+
+  function limitAuth(req) {
+    const ip = req.socket.remoteAddress || '';
+    const now = Date.now();
+    const entry = authAttempts.get(ip);
+    if (!entry || now - entry.since > AUTH_WINDOW_MS) {
+      authAttempts.set(ip, { count: 1, since: now });
+      if (authAttempts.size > 10_000) authAttempts.clear();
+      return;
+    }
+    if (++entry.count > AUTH_MAX_ATTEMPTS) throw new HttpError(429, 'Too many attempts. Wait a few minutes and try again.');
+  }
+
+  function credentials(input) {
+    const email = typeof input.email === 'string' ? input.email.trim().toLowerCase() : '';
+    const password = typeof input.password === 'string' ? input.password : '';
+    if (!EMAIL_RE.test(email)) throw new HttpError(400, 'Enter a valid email address.');
+    if (password.length < 8 || password.length > 200) throw new HttpError(400, 'Passwords are 8 to 200 characters.');
+    return { email, password };
+  }
+
+  async function signIn(req, res, user) {
+    const { token, maxAge } = await store.createSession(user.id);
+    const secure = isHttps(req) ? '; Secure' : '';
+    res.setHeader('set-cookie', `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`);
+    sendJson(res, 200, await store.account(user.id));
+  }
+
+  async function handleSignup(req, res) {
+    requireBilling();
+    limitAuth(req);
+    const { email, password } = credentials(await readJson(req));
+    const user = await store.createUser(email, password);
+    if (!user) throw new HttpError(409, 'There is already an account with that email. Sign in instead.');
+    await signIn(req, res, user);
+  }
+
+  async function handleLogin(req, res) {
+    requireBilling();
+    limitAuth(req);
+    const { email, password } = credentials(await readJson(req));
+    const user = await store.findByEmail(email);
+    if (!user || !(await verifyPassword(password, user.passwordHash))) {
+      throw new HttpError(401, 'That email and password do not match an account.');
+    }
+    await signIn(req, res, user);
+  }
+
+  async function handleLogout(req, res) {
+    await readJson(req);
+    await store.deleteSession(readCookie(req, SESSION_COOKIE));
+    res.setHeader('set-cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`);
+    sendJson(res, 200, { signedOut: true });
+  }
+
+  async function handleAccount(req, res) {
+    requireBilling();
+    const user = await currentUser(req);
+    sendJson(res, 200, user ? await store.account(user.id) : { signedIn: false });
+  }
+
+  function baseUrl(req) {
+    if (billing.publicUrl) return billing.publicUrl;
+    return `${isHttps(req) ? 'https' : 'http'}://${req.headers.host}`;
+  }
+
+  async function handleCheckout(req, res) {
+    requireBilling();
+    const input = await readJson(req);
+    const user = await requireUser(req);
+    const cents = Number(input.cents);
+    if (!billing.topupCents.includes(cents)) throw new HttpError(400, 'Choose one of the listed amounts.');
+    let session;
+    try {
+      session = await createCheckoutSession(billing, { user, cents, baseUrl: baseUrl(req) }, fetchImpl);
+    } catch (err) {
+      throw new HttpError(502, err.message);
+    }
+    sendJson(res, 200, { url: session.url });
+  }
+
+  /** Credit a finished Checkout when the browser returns, in case the webhook is slow or not set up. */
+  async function handleConfirm(req, res) {
+    requireBilling();
+    const input = await readJson(req);
+    const user = await requireUser(req);
+    let session;
+    try {
+      session = await getCheckoutSession(billing, String(input.session || ''), fetchImpl);
+    } catch (err) {
+      throw new HttpError(400, err.message);
+    }
+    const credit = paidCredit(session);
+    if (!credit || credit.userId !== user.id) throw new HttpError(400, "That payment isn't complete yet.");
+    const result = await store.credit(user.id, credit.id, credit.cents);
+    sendJson(res, 200, { ...result, cents: credit.cents });
+  }
+
+  async function handleWebhook(req, res) {
+    requireBilling();
+    if (!billing.webhookSecret) throw new HttpError(404, 'Set STRIPE_WEBHOOK_SECRET to receive webhooks');
+    const raw = await readRaw(req, 1_000_000);
+    if (!verifyStripeSignature(raw, req.headers['stripe-signature'], billing.webhookSecret)) {
+      throw new HttpError(400, 'Bad signature');
+    }
+    let event;
+    try {
+      event = JSON.parse(raw.toString('utf8'));
+    } catch {
+      throw new HttpError(400, 'Invalid JSON body');
+    }
+    if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
+      const credit = paidCredit(event.data?.object);
+      if (credit && (await store.getUser(credit.userId))) await store.credit(credit.userId, credit.id, credit.cents);
+    }
+    sendJson(res, 200, { received: true });
+  }
+
+  function publicBilling() {
+    if (!billing.enabled) return { enabled: false };
+    return {
+      enabled: true,
+      currency: billing.currency,
+      markupPercent: billing.markupPercent,
+      topupCents: billing.topupCents,
+      prices: pricingList(pricing, billing.markupPercent),
+    };
   }
 
   async function handleModels(res, providerId) {
@@ -239,9 +461,10 @@ export function createApp(
     res.end(body);
   }
 
-  return http.createServer(async (req, res) => {
+  const server = http.createServer(async (req, res) => {
     try {
       // Block DNS-rebinding: when bound to loopback, only answer to loopback names.
+      // (Stripe can't reach a loopback server anyway, so webhooks are unaffected.)
       if (checkHost && !LOOPBACK_HOSTS.has(hostname(req.headers.host))) {
         throw new HttpError(403, 'Forbidden host');
       }
@@ -257,7 +480,21 @@ export function createApp(
         case 'POST /api/chat':
           return await handleChat(req, res);
         case 'GET /api/config':
-          return sendJson(res, 200, { ads: adsConfig(env) });
+          return sendJson(res, 200, { ads: adsConfig(env), billing: publicBilling() });
+        case 'POST /api/auth/signup':
+          return await handleSignup(req, res);
+        case 'POST /api/auth/login':
+          return await handleLogin(req, res);
+        case 'POST /api/auth/logout':
+          return await handleLogout(req, res);
+        case 'GET /api/account':
+          return await handleAccount(req, res);
+        case 'POST /api/billing/checkout':
+          return await handleCheckout(req, res);
+        case 'POST /api/billing/confirm':
+          return await handleConfirm(req, res);
+        case 'POST /api/billing/webhook':
+          return await handleWebhook(req, res);
         case 'GET /api/settings':
           requireLocal(req);
           return sendJson(res, 200, { variables: settingsSummary() });
@@ -270,7 +507,12 @@ export function createApp(
           requireLocal(req);
           const { text } = await readJson(req);
           const applied = await applySettings(text);
-          return sendJson(res, 200, { applied, providers: providers.map(publicInfo), ads: adsConfig(env) });
+          return sendJson(res, 200, {
+            applied,
+            providers: providers.map(publicInfo),
+            ads: adsConfig(env),
+            billing: publicBilling(),
+          });
         }
         case 'GET /ads.txt':
         case 'HEAD /ads.txt':
@@ -293,6 +535,8 @@ export function createApp(
       sendJson(res, 502, { error: err.cause?.message || err.message || 'Request failed' });
     }
   });
+  server.billingStatus = () => ({ ...publicBilling(), pricingError, models: pricing.size });
+  return server;
 }
 
 /** Abort the upstream call on timeout, or when the browser disconnects. */
@@ -302,6 +546,29 @@ function requestSignal(res, timeoutMs) {
     if (!res.writableFinished) disconnected.abort();
   });
   return AbortSignal.any([AbortSignal.timeout(timeoutMs), disconnected.signal]);
+}
+
+async function readRaw(req, limit) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) throw new HttpError(413, 'Request is too large');
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+function readCookie(req, name) {
+  for (const part of (req.headers.cookie || '').split(';')) {
+    const eq = part.indexOf('=');
+    if (eq > 0 && part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
+  }
+  return '';
+}
+
+function isHttps(req) {
+  return Boolean(req.socket.encrypted) || String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
 }
 
 async function readJson(req) {
@@ -419,6 +686,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     }
     const ads = adsConfig(env);
     if (ads.enabled) console.log(`\n  Ads: AdSense ${ads.client}`);
+    const billing = server.billingStatus();
+    if (billing.enabled) {
+      console.log(`\n  Billing: on, ${billing.markupPercent}% markup, ${billing.models} priced model(s)`);
+      if (billing.pricingError) console.log(`  ⚠ Pricing not loaded (${billing.pricingError}). No model can be used until pricing.json is fixed.`);
+    }
     console.log('');
   });
 }

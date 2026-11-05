@@ -103,6 +103,7 @@ export function createCard(provider, model, { live = true } = {}) {
       footer.replaceChildren(
         ...[
           h('span', { class: 'usage', text: usage.length ? `${usage.join(' · ')} tokens` : '' }),
+          data.costText && h('span', { class: 'cost', text: data.costText }),
           TRUNCATED.has(data.stopReason) && h('span', { class: 'warn', text: 'Cut off (token limit)' }),
           h('span', { class: 'spacer' }),
           toggle,
