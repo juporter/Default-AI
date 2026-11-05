@@ -5,7 +5,8 @@ import { h, $, fill, formatDate } from './dom.js';
 
 let deps; // { getProviders, onChange(account) }
 let billing = { enabled: false };
-let account = null; // {email, balance, usage, payments} or null when signed out
+let account = null; // {email, balance, usage, payments, admin} or null when signed out
+let resetToken = ''; // from a password reset link
 const els = {};
 
 /** Micro-dollars to "$1.23". Small amounts get more decimals so a 0.04¢ answer isn't "$0.00". */
@@ -37,7 +38,13 @@ export function initAccount(options, billingConfig) {
     balance: $('#account-balance'),
     topups: $('#account-topups'),
     usage: $('#account-usage'),
+    payments: $('#account-payments'),
     prices: $('#account-prices'),
+    forgot: $('#account-forgot'),
+    resetForm: $('#account-reset'),
+    newPassword: $('#account-new-password'),
+    resetError: $('#account-reset-error'),
+    resetCancel: $('#account-reset-cancel'),
   });
   if (!billing.enabled) return;
 
@@ -48,6 +55,15 @@ export function initAccount(options, billingConfig) {
   });
   els.signup.addEventListener('click', () => {
     if (els.signinForm.reportValidity()) authenticate('/api/auth/signup');
+  });
+  els.forgot.addEventListener('click', forgotPassword);
+  els.resetForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    resetPassword();
+  });
+  els.resetCancel.addEventListener('click', () => {
+    resetToken = '';
+    render();
   });
   els.logout.addEventListener('click', async () => {
     await post('/api/auth/logout', {}).catch(() => {});
@@ -64,6 +80,7 @@ export function initAccount(options, billingConfig) {
 
 export const billingEnabled = () => billing.enabled;
 export const signedIn = () => Boolean(account);
+export const isAdmin = () => Boolean(account?.admin);
 
 /** The marked-up price for a model, or null if it can't be used while billing is on. */
 export function priceOf(providerId, model) {
@@ -79,6 +96,11 @@ export async function loadAccount() {
   if (!billing.enabled) return;
   const params = new URLSearchParams(location.search);
   const checkout = params.get('checkout');
+  if (params.get('reset')) {
+    // Keep the token out of the address bar (and browser history) once we have it.
+    resetToken = params.get('reset');
+    history.replaceState(null, '', `${location.pathname}#account`);
+  }
   if (checkout) {
     history.replaceState(null, '', `${location.pathname}${location.hash}`);
     try {
@@ -127,6 +149,40 @@ async function authenticate(url) {
   }
 }
 
+async function forgotPassword() {
+  els.error.hidden = true;
+  if (!els.email.value.trim()) {
+    els.error.textContent = 'Enter your email above first, then click Forgot password.';
+    els.error.hidden = false;
+    els.email.focus();
+    return;
+  }
+  els.forgot.disabled = true;
+  try {
+    await post('/api/auth/forgot', { email: els.email.value });
+    setStatus(`If there's an account for ${els.email.value.trim()}, we've emailed it a link to reset the password. It works for an hour.`);
+  } catch (err) {
+    els.error.textContent = err.message;
+    els.error.hidden = false;
+  } finally {
+    els.forgot.disabled = false;
+  }
+}
+
+async function resetPassword() {
+  els.resetError.hidden = true;
+  try {
+    const data = await post('/api/auth/reset', { token: resetToken, password: els.newPassword.value });
+    resetToken = '';
+    els.newPassword.value = '';
+    setAccount(data);
+    setStatus('Your password has been changed.');
+  } catch (err) {
+    els.resetError.textContent = err.message;
+    els.resetError.hidden = false;
+  }
+}
+
 async function buy(cents, button) {
   button.disabled = true;
   try {
@@ -152,13 +208,55 @@ function setStatus(message, isError = false) {
 
 function render() {
   if (!billing.enabled) return;
-  els.signinForm.hidden = Boolean(account);
-  els.signedIn.hidden = !account;
+  els.resetForm.hidden = !resetToken;
+  els.signinForm.hidden = Boolean(account) || Boolean(resetToken);
+  els.signedIn.hidden = !account || Boolean(resetToken);
   renderBalance();
   if (!account) return;
   els.emailLabel.textContent = account.email;
   renderUsage();
+  renderPayments(els.payments, account.payments || []);
 }
+
+/** Card payments and manual credits. `actions(payment)` can add a cell of buttons (the admin view's Refund). */
+export function renderPayments(el, payments, actions = null) {
+  if (!payments.length) {
+    fill(el, h('p', { class: 'muted', text: 'No payments yet.' }));
+    return;
+  }
+  fill(
+    el,
+    h(
+      'table',
+      { class: 'settings-table usage-table' },
+      h('thead', {}, headRow(actions ? ['When', 'What', 'Amount', ''] : ['When', 'What', 'Amount'], 2)),
+      h(
+        'tbody',
+        {},
+        payments.map((p) =>
+          h(
+            'tr',
+            {},
+            h('td', { text: formatDate(p.at) }),
+            h('td', { text: describePayment(p) }),
+            h('td', { class: 'num', text: formatCents(p.cents) }),
+            actions ? h('td', { class: 'num' }, actions(p)) : null,
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+function describePayment(p) {
+  if (p.kind === 'card') {
+    if (!p.refundedCents) return 'Card payment';
+    return p.refundedCents >= p.cents ? 'Card payment (refunded)' : `Card payment (${formatCents(p.refundedCents)} refunded)`;
+  }
+  return p.note || (p.cents > 0 ? 'Credit' : 'Debit');
+}
+
+export const formatCents = (cents) => `${cents < 0 ? '−' : ''}$${(Math.abs(cents) / 100).toFixed(2)}`;
 
 function renderBalance() {
   els.navBalance.textContent = account ? formatMoney(account.balance) : '';
@@ -239,7 +337,7 @@ function headRow(labels, numFrom) {
 }
 
 
-async function post(url, body) {
+export async function post(url, body) {
   const res = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);

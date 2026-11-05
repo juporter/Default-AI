@@ -33,8 +33,12 @@ export const BILLING_VARIABLES = [
   'BILLING_MARKUP_PERCENT',
   'BILLING_TOPUP_AMOUNTS',
   'PUBLIC_URL',
+  'ADMIN_EMAILS',
+  'RESEND_API_KEY',
+  'EMAIL_FROM',
 ];
-export const BILLING_SECRET_VARIABLES = ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET'];
+export const BILLING_SECRET_VARIABLES = ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'RESEND_API_KEY'];
+const RESET_TOKEN_MINUTES = 60;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -57,6 +61,15 @@ export function billingConfig(env) {
     topupCents: topups.length ? [...new Set(topups)].sort((a, b) => a - b) : [500, 1000, 2500],
     currency: 'usd',
     publicUrl: (env.PUBLIC_URL || '').replace(/\/+$/, ''),
+    adminEmails: new Set(
+      String(env.ADMIN_EMAILS || '')
+        .split(',')
+        .map((e) => e.trim().toLowerCase())
+        .filter(Boolean),
+    ),
+    resendKey: env.RESEND_API_KEY || '',
+    resendBase: (env.RESEND_API_BASE || 'https://api.resend.com').replace(/\/+$/, ''),
+    emailFrom: env.EMAIL_FROM || '',
   };
 }
 
@@ -173,6 +186,8 @@ export class BillingStore {
     this.data.sessions ??= {};
     this.data.usage ??= [];
     this.data.payments ??= {};
+    this.data.resets ??= {};
+    this.data.adjustments ??= [];
     return this.data;
   }
 
@@ -259,12 +274,12 @@ export class BillingStore {
   }
 
   /** Add credit for a Checkout session, once. Returns {credited, balance}. */
-  async credit(userId, checkoutId, cents) {
+  async credit(userId, checkoutId, cents, paymentIntent = '') {
     return this.update((data) => {
       const user = data.users[userId];
       if (!user) throw new Error('Account not found');
       if (data.payments[checkoutId]) return { credited: false, balance: user.balance };
-      data.payments[checkoutId] = { userId, cents, at: new Date().toISOString() };
+      data.payments[checkoutId] = { userId, cents, paymentIntent, refundedCents: 0, at: new Date().toISOString() };
       user.balance += cents * MICROS_PER_CENT;
       return { credited: true, balance: user.balance };
     });
@@ -281,13 +296,122 @@ export class BillingStore {
           usage.push(rest);
         }
       }
-      const payments = Object.values(data.payments)
-        .filter((p) => p.userId === userId)
-        .map(({ cents, at }) => ({ cents, at }))
-        .sort((a, b) => b.at.localeCompare(a.at));
-      return { email: user.email, balance: user.balance, usage, payments };
+      return { email: user.email, balance: user.balance, usage, payments: paymentsOf(data, userId) };
     });
   }
+
+  // --- Password reset -------------------------------------------------------
+
+  /** A one-time reset token for this email, or null if there's no such account. */
+  async createReset(email) {
+    return this.update((data) => {
+      const userId = data.emails[email];
+      if (!userId) return null;
+      const now = Date.now();
+      for (const [key, r] of Object.entries(data.resets)) {
+        // Drop expired tokens, and older tokens for this user: only the newest link works.
+        if (r.expiresAt < now || r.userId === userId) delete data.resets[key];
+      }
+      const token = randomBytes(32).toString('base64url');
+      data.resets[hashToken(token)] = { userId, expiresAt: now + RESET_TOKEN_MINUTES * 60_000 };
+      return token;
+    });
+  }
+
+  /** Set a new password with a reset token. Signs the user out everywhere. Returns the user, or null. */
+  async resetPassword(token, password) {
+    const passwordHash = await hashPassword(password);
+    return this.update((data) => {
+      const key = hashToken(String(token || ''));
+      const reset = data.resets[key];
+      if (!reset) return null;
+      delete data.resets[key];
+      const user = data.users[reset.userId];
+      if (!user || reset.expiresAt < Date.now()) return null;
+      user.passwordHash = passwordHash;
+      for (const [k, s] of Object.entries(data.sessions)) if (s.userId === user.id) delete data.sessions[k];
+      return user;
+    });
+  }
+
+  // --- Admin ----------------------------------------------------------------
+
+  /** Every account with totals, newest first, optionally filtered by email. */
+  async listUsers(query = '') {
+    const q = query.trim().toLowerCase();
+    return this.read((data) => {
+      const totals = new Map();
+      for (const u of data.usage) {
+        const t = totals.get(u.userId) || { spent: 0, answers: 0 };
+        t.spent += u.cost;
+        t.answers += 1;
+        totals.set(u.userId, t);
+      }
+      const paid = new Map();
+      for (const p of Object.values(data.payments)) {
+        paid.set(p.userId, (paid.get(p.userId) || 0) + p.cents - (p.refundedCents || 0));
+      }
+      return Object.values(data.users)
+        .filter((u) => !q || u.email.includes(q))
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+        .map((u) => ({
+          id: u.id,
+          email: u.email,
+          createdAt: u.createdAt,
+          balance: u.balance,
+          paidCents: paid.get(u.id) || 0,
+          spent: totals.get(u.id)?.spent || 0,
+          answers: totals.get(u.id)?.answers || 0,
+        }));
+    });
+  }
+
+  /** One account in full, for the admin view. */
+  async adminUser(userId) {
+    const account = await this.account(userId, 50);
+    if (!account) return null;
+    return this.read((data) => ({ id: userId, createdAt: data.users[userId].createdAt, ...account }));
+  }
+
+  /** Add (or, with negative cents, take away) credit by hand. Returns the new balance. */
+  async adjust(userId, cents, note, by) {
+    return this.update((data) => {
+      const user = data.users[userId];
+      if (!user) throw new Error('Account not found');
+      user.balance += cents * MICROS_PER_CENT;
+      data.adjustments.push({ userId, cents, note, by, at: new Date().toISOString() });
+      return user.balance;
+    });
+  }
+
+  async payment(checkoutId) {
+    return this.read((data) => data.payments[checkoutId] || null);
+  }
+
+  /** Record a Stripe refund: the refunded amount comes off the balance. Returns the new balance. */
+  async recordRefund(checkoutId, cents, by) {
+    return this.update((data) => {
+      const payment = data.payments[checkoutId];
+      if (!payment) throw new Error('Payment not found');
+      if ((payment.refundedCents || 0) + cents > payment.cents) throw new Error('That is more than is left to refund.');
+      payment.refundedCents = (payment.refundedCents || 0) + cents;
+      const user = data.users[payment.userId];
+      user.balance -= cents * MICROS_PER_CENT;
+      data.adjustments.push({ userId: payment.userId, cents: -cents, note: 'Refund to card', by, at: new Date().toISOString() });
+      return user.balance;
+    });
+  }
+}
+
+/** Card payments and manual credits for one user, newest first. */
+function paymentsOf(data, userId) {
+  const payments = Object.entries(data.payments)
+    .filter(([, p]) => p.userId === userId)
+    .map(([id, p]) => ({ id, kind: 'card', cents: p.cents, refundedCents: p.refundedCents || 0, at: p.at }));
+  const adjustments = data.adjustments
+    .filter((a) => a.userId === userId && a.note !== 'Refund to card')
+    .map((a) => ({ kind: 'credit', cents: a.cents, note: a.note, at: a.at }));
+  return [...payments, ...adjustments].sort((a, b) => b.at.localeCompare(a.at));
 }
 
 function trimUsage(data, userId) {
@@ -351,7 +475,38 @@ export function paidCredit(session) {
   if (!userId || !Number.isFinite(cents) || cents <= 0) return null;
   // Never credit more than was actually paid.
   if (Number.isFinite(session.amount_total) && session.amount_total < cents) return null;
-  return { userId, cents, id: session.id };
+  const paymentIntent = typeof session.payment_intent === 'string' ? session.payment_intent : session.payment_intent?.id || '';
+  return { userId, cents, id: session.id, paymentIntent };
+}
+
+/** Refund part or all of a card payment. https://docs.stripe.com/api/refunds/create */
+export async function createRefund(config, { paymentIntent, cents }, fetchImpl = fetch) {
+  const form = new URLSearchParams({ payment_intent: paymentIntent, amount: String(cents), reason: 'requested_by_customer' });
+  return stripeRequest(config, 'POST', '/v1/refunds', form, fetchImpl);
+}
+
+// ---------------------------------------------------------------------------
+// Email (Resend's HTTP API, so there are no dependencies)
+// ---------------------------------------------------------------------------
+
+export const emailConfigured = (config) => Boolean(config.resendKey && config.emailFrom);
+
+/** Send the password reset email. https://resend.com/docs/api-reference/emails/send-email */
+export async function sendResetEmail(config, { to, link }, fetchImpl = fetch) {
+  const text =
+    `Someone asked to reset the password for your Default AI Prompt account (${to}).\n\n` +
+    `To choose a new password, open this link within ${RESET_TOKEN_MINUTES} minutes:\n${link}\n\n` +
+    "If it wasn't you, ignore this email. Your password stays the same.";
+  const res = await fetchImpl(`${config.resendBase}/emails`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${config.resendKey}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ from: config.emailFrom, to: [to], subject: 'Reset your password', text }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!res.ok) {
+    const json = await res.json().catch(() => ({}));
+    throw new Error(`Email: ${json.message || `HTTP ${res.status}`}`);
+  }
 }
 
 /**
