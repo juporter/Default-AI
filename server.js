@@ -52,7 +52,6 @@ import {
   pricingList,
   costMicros,
   estimateTokens,
-  BillingStore,
   verifyPassword,
   EMAIL_RE,
   SESSION_COOKIE,
@@ -64,12 +63,13 @@ import {
   emailConfigured,
   sendResetEmail,
 } from './billing.js';
+import { BillingStore } from './billing-store.js';
 
 const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(APP_DIR, 'public');
 const DEFAULT_ENV_FILE = path.join(APP_DIR, '.env');
 const DEFAULT_PRICING_FILE = path.join(APP_DIR, 'pricing.json');
-const DEFAULT_BILLING_FILE = path.join(APP_DIR, 'data', 'billing.json');
+const DEFAULT_BILLING_FILE = path.join(APP_DIR, 'data', 'billing.db');
 const AUTH_WINDOW_MS = 15 * 60 * 1000;
 const AUTH_MAX_ATTEMPTS = 10;
 // Large enough for a prompt with attached files (the browser caps attachments at 2 MB).

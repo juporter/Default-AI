@@ -8,7 +8,9 @@ import { once } from 'node:events';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
 import { createApp } from '../server.js';
+import { BillingStore } from '../billing-store.js';
 import {
   billingConfig,
   parsePricing,
@@ -104,7 +106,16 @@ test('billing settings can be imported, and Stripe secrets are masked', () => {
 
 const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'default-ai-billing-'));
 const pricingFile = path.join(tmpDir, 'pricing.json');
-const billingFile = path.join(tmpDir, 'data', 'billing.json');
+const billingFile = path.join(tmpDir, 'data', 'billing.db');
+
+/** Every row of every table, as text, to check that secrets are never stored in the clear. */
+function dumpDatabase() {
+  const db = new DatabaseSync(billingFile, { readOnly: true });
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all();
+  const dump = JSON.stringify(tables.map(({ name }) => db.prepare(`SELECT * FROM "${name}"`).all()));
+  db.close();
+  return dump;
+}
 const WEBHOOK_SECRET = 'whsec_testsecret';
 let upstream;
 let app;
@@ -327,10 +338,14 @@ test('models without a price are refused', async () => {
 });
 
 test('balances and sessions survive a restart', async () => {
-  const saved = JSON.parse(readFileSync(billingFile, 'utf8'));
-  const user = Object.values(saved.users)[0];
+  const reopened = new BillingStore(billingFile);
+  const user = await reopened.userForToken(cookie.split('=')[1]);
+  assert.equal(user.email, 'ada@example.com');
   assert.equal(user.balance, 15_000_000 - 12_600 - 4800);
-  assert.ok(!JSON.stringify(saved).includes(cookie.split('=')[1])); // tokens are stored hashed
+  reopened.close();
+  const dump = dumpDatabase();
+  assert.ok(!dump.includes(cookie.split('=')[1])); // session tokens are stored hashed
+  assert.ok(!dump.includes('a good password'));
 });
 
 test('signing out ends the session', async () => {
@@ -385,7 +400,7 @@ test('password reset: only the newest link works, and tokens are stored hashed',
   await post('/api/auth/forgot', { email: 'ada@example.com' });
   await post('/api/auth/forgot', { email: 'ada@example.com' });
   const [older, newer] = emails.slice(-2).map(resetToken);
-  assert.ok(!readFileSync(billingFile, 'utf8').includes(newer));
+  assert.ok(!dumpDatabase().includes(newer));
   let res = await post('/api/auth/reset', { token: older, password: 'brand new password' });
   assert.equal(res.status, 400);
   res = await post('/api/auth/reset', { token: newer, password: 'brand new password' });

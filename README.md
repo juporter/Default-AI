@@ -19,7 +19,7 @@ You only need keys for the providers you want to use. Providers without a key ar
 
 ## Quick start
 
-Requires Node.js 20.12 or newer. There are no npm dependencies to install.
+Requires Node.js 20.12 or newer (22.13 or newer if you turn on billing, which uses Node's built-in SQLite). There are no npm dependencies to install.
 
 ```sh
 git clone https://github.com/juporter/Default-AI.git
@@ -105,7 +105,9 @@ If you host the app for other people, billing lets them pay for what they use in
 
 **Admin** (for `ADMIN_EMAILS`) lists every account with its balance, what it has paid and spent, and how many answers it has had. Open an account to see its payments and usage, add or take away credit with a reason the user sees, or refund part or all of a card payment. Refunds go back to the card through Stripe, and the refunded amount comes off the user's balance.
 
-Accounts, balances and usage are kept in `data/billing.json` (passwords are hashed with scrypt; session tokens are stored hashed). Back this file up: it is the record of what users have paid for. It suits a small site; move to a database before you have many thousands of users.
+Accounts, balances, payments and usage are kept in a SQLite database, `data/billing.db` (set `BILLING_DATA_FILE` to put it elsewhere). It's created the first time billing is used. Passwords are hashed with scrypt, and session and reset tokens are stored hashed. If you used an earlier version, `data/billing.json` is imported automatically on first start and renamed to `billing.json.imported`.
+
+**Back up the database**: it is the record of what users have paid for. While the app is running, use `sqlite3 data/billing.db ".backup backup.db"`, or stop the app and copy `data/billing.db`. Node prints a one-time "SQLite is an experimental feature" warning at startup; that's expected.
 
 A user who sends to several models at once can go slightly below zero, because every answer in that batch is charged after it arrives. The next prompt is then refused until they top up.
 
@@ -119,7 +121,7 @@ browser ──► server.js ──► OpenAI / Anthropic / Meta / Google / xAI /
 
 - `providers.js` describes each provider and converts between the app's format and each API. OpenAI, Meta, Grok, DeepSeek and Kimi use the OpenAI Chat Completions format. Claude uses the Anthropic Messages API. Gemini uses `generateContent`. Perplexity uses its Agent API with web search turned on.
 - `settings.js` reads, checks and saves imported settings files, and holds the ad settings.
-- `billing.js` holds accounts, pricing, charges and the Stripe calls (plain `fetch`, no Stripe SDK).
+- `billing.js` holds pricing, passwords, the Stripe calls and email (plain `fetch`, no SDKs). `billing-store.js` keeps accounts, balances and usage in SQLite.
 - `public/` holds the UI: plain HTML, CSS and JavaScript with no build step. `public/importers.js` reads chat exports (including .zip files) in the browser, and `public/store.js` keeps History in the browser's IndexedDB.
 
 ## Configuration
