@@ -80,9 +80,10 @@ test('only paid Checkout sessions are credited, never more than was paid', () =>
     id: 'cs_1',
     payment_status: 'paid',
     amount_total: 1000,
+    payment_intent: 'pi_1',
     metadata: { user_id: 'u1', credit_cents: '1000' },
   };
-  assert.deepEqual(paidCredit(session), { userId: 'u1', cents: 1000, id: 'cs_1' });
+  assert.deepEqual(paidCredit(session), { userId: 'u1', cents: 1000, id: 'cs_1', paymentIntent: 'pi_1' });
   assert.equal(paidCredit({ ...session, payment_status: 'unpaid' }), null);
   assert.equal(paidCredit({ ...session, amount_total: 500 }), null);
 });
@@ -109,6 +110,8 @@ let upstream;
 let app;
 let base;
 const stripeSessions = new Map();
+const emails = []; // what the fake Resend was asked to send
+const refunds = []; // what the fake Stripe was asked to refund
 
 function fakeUpstream(req, res) {
   let body = '';
@@ -128,11 +131,22 @@ function fakeUpstream(req, res) {
         payment_status: 'unpaid',
         amount_total: Number(form.get('line_items[0][price_data][unit_amount]')),
         client_reference_id: form.get('client_reference_id'),
+        payment_intent: `pi_test_${stripeSessions.size + 1}`,
         success_url: form.get('success_url'),
         metadata: { user_id: form.get('metadata[user_id]'), credit_cents: form.get('metadata[credit_cents]') },
       };
       stripeSessions.set(session.id, session);
       return send(200, session);
+    }
+    if (req.url === '/stripe/v1/refunds' && req.method === 'POST') {
+      const form = new URLSearchParams(body);
+      refunds.push({ paymentIntent: form.get('payment_intent'), amount: Number(form.get('amount')) });
+      return send(200, { object: 'refund', id: `re_${refunds.length}`, status: 'succeeded' });
+    }
+    if (req.url === '/resend/emails' && req.method === 'POST') {
+      assert.equal(req.headers.authorization, 'Bearer re_test');
+      emails.push(JSON.parse(body));
+      return send(200, { id: `email_${emails.length}` });
     }
     const m = req.url.match(/^\/stripe\/v1\/checkout\/sessions\/(cs_\w+)$/);
     if (m) return stripeSessions.has(m[1]) ? send(200, stripeSessions.get(m[1])) : send(404, { error: { message: 'No such session' } });
@@ -167,8 +181,12 @@ before(async () => {
       STRIPE_WEBHOOK_SECRET: WEBHOOK_SECRET,
       STRIPE_API_BASE: `${up}/stripe`,
       BILLING_MARKUP_PERCENT: '20',
+      ADMIN_EMAILS: 'boss@example.com',
+      RESEND_API_KEY: 're_test',
+      RESEND_API_BASE: `${up}/resend`,
+      EMAIL_FROM: 'Default AI <billing@example.com>',
     },
-    { host: '127.0.0.1', envFile: path.join(tmpDir, '.env'), pricingFile, billingFile },
+    { host: '127.0.0.1', envFile: path.join(tmpDir, '.env'), pricingFile, billingFile, authMaxAttempts: 30 },
   ).listen(0, '127.0.0.1');
   await once(app, 'listening');
   base = `http://127.0.0.1:${app.address().port}`;
@@ -319,4 +337,140 @@ test('signing out ends the session', async () => {
   await post('/api/auth/logout', {}, cookie);
   const account = await (await fetch(`${base}/api/account`, { headers: { cookie } })).json();
   assert.equal(account.signedIn, false);
+});
+
+// --- Password reset ---------------------------------------------------------
+
+const resetToken = (email) => new URL(email.text.match(/https?:\/\/\S+/)[0]).searchParams.get('reset');
+
+test('password reset: emails a one-time link that sets a new password and signs out other sessions', async () => {
+  let res = await post('/api/auth/login', { email: 'ada@example.com', password: 'a good password' });
+  const oldSession = cookieOf(res);
+
+  // Unknown emails get the same answer, and no email is sent.
+  res = await post('/api/auth/forgot', { email: 'nobody@example.com' });
+  assert.equal(res.status, 200);
+  assert.equal(emails.length, 0);
+
+  res = await post('/api/auth/forgot', { email: 'Ada@Example.com' });
+  assert.equal(res.status, 200);
+  assert.equal(emails.length, 1);
+  assert.deepEqual(emails[0].to, ['ada@example.com']);
+  assert.equal(emails[0].from, 'Default AI <billing@example.com>');
+  const token = resetToken(emails[0]);
+  assert.ok(token.length > 30);
+  assert.match(emails[0].text, /\/\?reset=[\w-]+#account/);
+
+  res = await post('/api/auth/reset', { token: 'wrong', password: 'brand new password' });
+  assert.equal(res.status, 400);
+  res = await post('/api/auth/reset', { token, password: 'short' });
+  assert.equal(res.status, 400);
+  res = await post('/api/auth/reset', { token, password: 'brand new password' });
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).email, 'ada@example.com');
+
+  // The link only works once, the old session is gone, the old password no longer works.
+  res = await post('/api/auth/reset', { token, password: 'another password' });
+  assert.equal(res.status, 400);
+  const account = await (await fetch(`${base}/api/account`, { headers: { cookie: oldSession } })).json();
+  assert.equal(account.signedIn, false);
+  res = await post('/api/auth/login', { email: 'ada@example.com', password: 'a good password' });
+  assert.equal(res.status, 401);
+  res = await post('/api/auth/login', { email: 'ada@example.com', password: 'brand new password' });
+  assert.equal(res.status, 200);
+  cookie = cookieOf(res);
+});
+
+test('password reset: only the newest link works, and tokens are stored hashed', async () => {
+  await post('/api/auth/forgot', { email: 'ada@example.com' });
+  await post('/api/auth/forgot', { email: 'ada@example.com' });
+  const [older, newer] = emails.slice(-2).map(resetToken);
+  assert.ok(!readFileSync(billingFile, 'utf8').includes(newer));
+  let res = await post('/api/auth/reset', { token: older, password: 'brand new password' });
+  assert.equal(res.status, 400);
+  res = await post('/api/auth/reset', { token: newer, password: 'brand new password' });
+  assert.equal(res.status, 200);
+  cookie = cookieOf(res);
+});
+
+// --- Admin ------------------------------------------------------------------
+
+let adminCookie;
+
+test('admin: only ADMIN_EMAILS can use the admin API', async () => {
+  let res = await fetch(`${base}/api/admin/users`, { headers: { cookie } });
+  assert.equal(res.status, 403);
+  assert.equal((await (await fetch(`${base}/api/account`, { headers: { cookie } })).json()).admin, false);
+  res = await fetch(`${base}/api/admin/users`);
+  assert.equal(res.status, 401);
+
+  res = await post('/api/auth/signup', { email: 'boss@example.com', password: 'boss password' });
+  adminCookie = cookieOf(res);
+  assert.equal((await res.json()).admin, true);
+  res = await fetch(`${base}/api/admin/users`, { headers: { cookie: adminCookie } });
+  assert.equal(res.status, 200);
+  const { users } = await res.json();
+  const ada = users.find((u) => u.email === 'ada@example.com');
+  assert.equal(ada.paidCents, 1500);
+  assert.equal(ada.answers, 2);
+  assert.equal(ada.balance, 15_000_000 - 12_600 - 4800);
+  assert.ok(!JSON.stringify(users).includes('scrypt'));
+
+  const filtered = await (await fetch(`${base}/api/admin/users?q=boss`, { headers: { cookie: adminCookie } })).json();
+  assert.deepEqual(filtered.users.map((u) => u.email), ['boss@example.com']);
+});
+
+test('admin: add and remove credit, shown to the user with the reason', async () => {
+  const { users } = await (await fetch(`${base}/api/admin/users?q=ada`, { headers: { cookie: adminCookie } })).json();
+  const ada = users[0];
+  let res = await post('/api/admin/credit', { userId: ada.id, cents: 250, note: 'Sorry about the outage' }, adminCookie);
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).balance, ada.balance + 2_500_000);
+  res = await post('/api/admin/credit', { userId: ada.id, cents: -50 }, adminCookie);
+  assert.equal((await res.json()).balance, ada.balance + 2_000_000);
+  res = await post('/api/admin/credit', { userId: ada.id, cents: 1.5 }, adminCookie);
+  assert.equal(res.status, 400);
+  res = await post('/api/admin/credit', { userId: ada.id, cents: 100 }, cookie); // not an admin
+  assert.equal(res.status, 403);
+
+  const account = await (await fetch(`${base}/api/account`, { headers: { cookie } })).json();
+  assert.deepEqual(
+    account.payments.filter((p) => p.kind === 'credit').map((p) => [p.cents, p.note]),
+    [
+      [-50, 'Debit'],
+      [250, 'Sorry about the outage'],
+    ],
+  );
+});
+
+test('admin: refund a card payment through Stripe, never more than was paid', async () => {
+  const { users } = await (await fetch(`${base}/api/admin/users?q=ada`, { headers: { cookie: adminCookie } })).json();
+  const detail = await (await fetch(`${base}/api/admin/user?id=${users[0].id}`, { headers: { cookie: adminCookie } })).json();
+  const payment = detail.payments.find((p) => p.kind === 'card' && p.cents === 1000);
+  assert.ok(payment);
+
+  let res = await post('/api/admin/refund', { paymentId: payment.id, cents: 1001 }, adminCookie);
+  assert.equal(res.status, 400);
+  res = await post('/api/admin/refund', { paymentId: payment.id, cents: 400 }, adminCookie);
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).balance, users[0].balance - 4_000_000);
+  assert.deepEqual(refunds.at(-1), { paymentIntent: stripeSessions.get(payment.id).payment_intent, amount: 400 });
+
+  res = await post('/api/admin/refund', { paymentId: payment.id, cents: 601 }, adminCookie);
+  assert.equal(res.status, 400); // only $6.00 left
+  res = await post('/api/admin/refund', { paymentId: payment.id, cents: 600 }, adminCookie);
+  assert.equal(res.status, 200);
+
+  const after = await (await fetch(`${base}/api/admin/user?id=${users[0].id}`, { headers: { cookie: adminCookie } })).json();
+  assert.equal(after.payments.find((p) => p.id === payment.id).refundedCents, 1000);
+  assert.equal(refunds.length, 2);
+});
+
+test('sign-in, sign-up and reset requests are rate-limited', async () => {
+  let status;
+  for (let i = 0; i < 31 && status !== 429; i++) {
+    status = (await post('/api/auth/login', { email: 'ada@example.com', password: 'guessing wrong' })).status;
+  }
+  assert.equal(status, 429);
+  assert.equal((await post('/api/auth/forgot', { email: 'ada@example.com' })).status, 429);
 });

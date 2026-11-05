@@ -20,6 +20,7 @@
           <a href="#history" id="nav-history">History</a>
           <a href="#settings" id="nav-settings">Settings</a>
           <a href="#account" id="nav-account" hidden>Account <span id="nav-balance" class="nav-balance"></span></a>
+          <a href="#admin" id="nav-admin" hidden>Admin</a>
         </nav>
       </header>
 
@@ -174,6 +175,19 @@
             <div class="account-actions">
               <button type="submit" id="account-login" class="primary">Sign in</button>
               <button type="button" id="account-signup" class="ghost">Create account</button>
+              <button type="button" id="account-forgot" class="link-button">Forgot password?</button>
+            </div>
+          </form>
+
+          <form id="account-reset" class="panel account-form" hidden>
+            <h2>Choose a new password</h2>
+            <p class="muted">You'll be signed in afterwards, and signed out everywhere else.</p>
+            <label for="account-new-password" class="field-label">New password</label>
+            <input type="password" id="account-new-password" autocomplete="new-password" minlength="8" required />
+            <p id="account-reset-error" class="error-text" role="alert" hidden></p>
+            <div class="account-actions">
+              <button type="submit" class="primary">Save password</button>
+              <button type="button" id="account-reset-cancel" class="ghost">Cancel</button>
             </div>
           </form>
 
@@ -196,6 +210,11 @@
               <div id="account-usage" class="table-wrap"></div>
             </section>
 
+            <section class="panel" aria-labelledby="payments-heading">
+              <h2 id="payments-heading">Payments and credits</h2>
+              <div id="account-payments" class="table-wrap"></div>
+            </section>
+
           </div>
 
           <section class="panel" aria-labelledby="prices-heading">
@@ -203,6 +222,22 @@
             <p class="muted">Per million tokens. Input is your prompt and files, output is the answer.</p>
             <div id="account-prices" class="table-wrap"></div>
           </section>
+        </section>
+
+        <!-- Admin (only for ADMIN_EMAILS) --------------------------------- -->
+        <section id="view-admin" class="view" aria-label="Admin" hidden>
+          <p id="admin-status" class="status-line" role="status" hidden></p>
+          <section class="panel" aria-labelledby="admin-users-heading">
+            <div class="panel-head">
+              <h2 id="admin-users-heading">Users</h2>
+              <div class="panel-actions">
+                <label for="admin-search" class="visually-hidden">Search by email</label>
+                <input type="search" id="admin-search" class="admin-search" placeholder="Search by email" autocomplete="off" />
+              </div>
+            </div>
+            <div id="admin-users" class="table-wrap"></div>
+          </section>
+          <section id="admin-detail" class="panel" aria-live="polite" hidden></section>
         </section>
       </main>
 

@@ -97,7 +97,13 @@ If you host the app for other people, billing lets them pay for what they use in
 | `STRIPE_WEBHOOK_SECRET` | Signing secret of a webhook endpoint at `https://your-site/api/billing/webhook` listening for `checkout.session.completed` and `checkout.session.async_payment_succeeded`. Optional: payments are also credited when the user returns from Checkout, but the webhook covers users who close the tab. |
 | `BILLING_MARKUP_PERCENT` | Added on top of provider prices (default 20). |
 | `BILLING_TOPUP_AMOUNTS` | Top-up amounts in dollars (default `5,10,25`). |
-| `PUBLIC_URL` | Your site's address, for Stripe's return links. Defaults to the address the browser used. |
+| `PUBLIC_URL` | Your site's address, for Stripe's return links and password reset emails. Defaults to the address the browser used. |
+| `ADMIN_EMAILS` | Accounts that get the **Admin** tab, separated by commas, e.g. `you@example.com`. |
+| `RESEND_API_KEY` / `EMAIL_FROM` | Sends password reset emails through [Resend](https://resend.com). `EMAIL_FROM` is the sender, e.g. `Default AI <billing@yourdomain.com>`, on a domain you've verified in Resend. Without these, reset links are printed in the server's console instead. |
+
+**Forgot password?** on the sign-in form emails a reset link that works once, for an hour. Using it signs the account out everywhere else. The page gives the same answer whether or not an account exists, so it can't be used to find out who has one.
+
+**Admin** (for `ADMIN_EMAILS`) lists every account with its balance, what it has paid and spent, and how many answers it has had. Open an account to see its payments and usage, add or take away credit with a reason the user sees, or refund part or all of a card payment. Refunds go back to the card through Stripe, and the refunded amount comes off the user's balance.
 
 Accounts, balances and usage are kept in `data/billing.json` (passwords are hashed with scrypt; session tokens are stored hashed). Back this file up: it is the record of what users have paid for. It suits a small site; move to a database before you have many thousands of users.
 
@@ -158,4 +164,4 @@ Once the key is set, the model dropdown lists that host's models.
 npm test
 ```
 
-The tests check the request and response conversion for every provider, the chat-export importers (including real .zip files), settings import, the Markdown renderer's escaping, billing (pricing maths, Stripe signatures, and sign-up → top-up → charge through the server against a fake Stripe), and the whole server. The server tests run against a fake provider, so no API keys are needed.
+The tests check the request and response conversion for every provider, the chat-export importers (including real .zip files), settings import, the Markdown renderer's escaping, billing (pricing maths, Stripe signatures, sign-up → top-up → charge, password reset, and admin credits and refunds, through the server against a fake Stripe and email service), and the whole server. The server tests run against a fake provider, so no API keys are needed.

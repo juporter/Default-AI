@@ -21,6 +21,12 @@
 //   POST /api/billing/checkout       {cents} -> {url} of a Stripe Checkout page
 //   POST /api/billing/confirm        {session} -> credit a finished Checkout
 //   POST /api/billing/webhook        Stripe webhook (checkout.session.completed)
+//   POST /api/auth/forgot            {email} -> email a password reset link
+//   POST /api/auth/reset             {token, password} -> new password, signed in
+//   GET  /api/admin/users?q=         accounts with balances (ADMIN_EMAILS only)
+//   GET  /api/admin/user?id=         one account: payments, credits, usage
+//   POST /api/admin/credit           {userId, cents, note} -> add or remove credit
+//   POST /api/admin/refund           {paymentId, cents} -> refund a card payment through Stripe
 
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
@@ -54,6 +60,9 @@ import {
   getCheckoutSession,
   paidCredit,
   verifyStripeSignature,
+  createRefund,
+  emailConfigured,
+  sendResetEmail,
 } from './billing.js';
 
 const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -101,7 +110,7 @@ class HttpError extends Error {
 /**
  * Create the HTTP server (not yet listening).
  * @param {Record<string, string|undefined>} env  usually process.env plus .env
- * @param {{fetchImpl?: typeof fetch, host?: string, envFile?: string, pricingFile?: string, billingFile?: string}} [options]
+ * @param {{fetchImpl?: typeof fetch, host?: string, envFile?: string, pricingFile?: string, billingFile?: string, authMaxAttempts?: number}} [options]
  */
 export function createApp(
   initialEnv = process.env,
@@ -111,6 +120,7 @@ export function createApp(
     envFile = DEFAULT_ENV_FILE,
     pricingFile = initialEnv.PRICING_FILE || DEFAULT_PRICING_FILE,
     billingFile = initialEnv.BILLING_DATA_FILE || DEFAULT_BILLING_FILE,
+    authMaxAttempts = AUTH_MAX_ATTEMPTS,
   } = {},
 ) {
   // Settings can change at runtime (Settings → Import), so keep them mutable.
@@ -248,7 +258,7 @@ export function createApp(
       if (authAttempts.size > 10_000) authAttempts.clear();
       return;
     }
-    if (++entry.count > AUTH_MAX_ATTEMPTS) throw new HttpError(429, 'Too many attempts. Wait a few minutes and try again.');
+    if (++entry.count > authMaxAttempts) throw new HttpError(429, 'Too many attempts. Wait a few minutes and try again.');
   }
 
   function credentials(input) {
@@ -263,7 +273,13 @@ export function createApp(
     const { token, maxAge } = await store.createSession(user.id);
     const secure = isHttps(req) ? '; Secure' : '';
     res.setHeader('set-cookie', `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`);
-    sendJson(res, 200, await store.account(user.id));
+    sendJson(res, 200, await accountFor(user));
+  }
+
+  const isAdmin = (user) => Boolean(user) && billing.adminEmails.has(user.email);
+
+  async function accountFor(user) {
+    return { ...(await store.account(user.id)), admin: isAdmin(user) };
   }
 
   async function handleSignup(req, res) {
@@ -296,7 +312,98 @@ export function createApp(
   async function handleAccount(req, res) {
     requireBilling();
     const user = await currentUser(req);
-    sendJson(res, 200, user ? await store.account(user.id) : { signedIn: false });
+    sendJson(res, 200, user ? await accountFor(user) : { signedIn: false });
+  }
+
+  // --- Password reset --------------------------------------------------------
+
+  async function handleForgot(req, res) {
+    requireBilling();
+    limitAuth(req);
+    const input = await readJson(req);
+    const email = typeof input.email === 'string' ? input.email.trim().toLowerCase() : '';
+    if (!EMAIL_RE.test(email)) throw new HttpError(400, 'Enter a valid email address.');
+    const token = await store.createReset(email);
+    if (token) {
+      const link = `${baseUrl(req)}/?reset=${token}#account`;
+      if (emailConfigured(billing)) {
+        try {
+          await sendResetEmail(billing, { to: email, link }, fetchImpl);
+        } catch (err) {
+          console.error(`Password reset email to ${email} failed: ${err.message}`);
+          throw new HttpError(502, "We couldn't send the email just now. Try again in a few minutes.");
+        }
+      } else {
+        // No email service yet: the person running the server can pass the link on.
+        console.log(`Password reset link for ${email} (set RESEND_API_KEY and EMAIL_FROM to email it): ${link}`);
+      }
+    }
+    // Same answer whether or not the account exists, so this can't be used to find out who has one.
+    sendJson(res, 200, { sent: true });
+  }
+
+  async function handleReset(req, res) {
+    requireBilling();
+    limitAuth(req);
+    const input = await readJson(req);
+    const password = typeof input.password === 'string' ? input.password : '';
+    if (password.length < 8 || password.length > 200) throw new HttpError(400, 'Passwords are 8 to 200 characters.');
+    const user = await store.resetPassword(input.token, password);
+    if (!user) throw new HttpError(400, 'This reset link has expired or was already used. Ask for a new one.');
+    await signIn(req, res, user);
+  }
+
+  // --- Admin -----------------------------------------------------------------
+
+  async function requireAdmin(req) {
+    requireBilling();
+    const user = await requireUser(req);
+    if (!isAdmin(user)) throw new HttpError(403, 'Only admins can do that.');
+    return user;
+  }
+
+  async function handleAdminUser(req, res, id) {
+    await requireAdmin(req);
+    const user = await store.adminUser(String(id || ''));
+    if (!user) throw new HttpError(404, 'Account not found');
+    sendJson(res, 200, user);
+  }
+
+  async function handleAdminCredit(req, res) {
+    const input = await readJson(req);
+    const admin = await requireAdmin(req);
+    const cents = Number(input.cents);
+    if (!Number.isInteger(cents) || cents === 0 || Math.abs(cents) > 1_000_000) {
+      throw new HttpError(400, 'Enter an amount between -$10,000 and $10,000.');
+    }
+    const note = typeof input.note === 'string' ? input.note.trim().slice(0, 200) : '';
+    if (!(await store.getUser(String(input.userId || '')))) throw new HttpError(404, 'Account not found');
+    const balance = await store.adjust(input.userId, cents, note || (cents > 0 ? 'Credit' : 'Debit'), admin.email);
+    sendJson(res, 200, { balance });
+  }
+
+  async function handleAdminRefund(req, res) {
+    const input = await readJson(req);
+    const admin = await requireAdmin(req);
+    const paymentId = String(input.paymentId || '');
+    const payment = await store.payment(paymentId);
+    if (!payment) throw new HttpError(404, 'Payment not found');
+    const cents = Number(input.cents);
+    const left = payment.cents - (payment.refundedCents || 0);
+    if (!Number.isInteger(cents) || cents <= 0 || cents > left) {
+      throw new HttpError(400, `Refund between $0.01 and $${(left / 100).toFixed(2)}.`);
+    }
+    let paymentIntent = payment.paymentIntent;
+    try {
+      // Payments credited before refunds existed didn't store this; look it up.
+      if (!paymentIntent) paymentIntent = paidCredit(await getCheckoutSession(billing, paymentId, fetchImpl))?.paymentIntent;
+      if (!paymentIntent) throw new Error('Stripe has no card payment for this checkout.');
+      await createRefund(billing, { paymentIntent, cents }, fetchImpl);
+    } catch (err) {
+      throw new HttpError(502, err.message);
+    }
+    const balance = await store.recordRefund(paymentId, cents, admin.email);
+    sendJson(res, 200, { balance });
   }
 
   function baseUrl(req) {
@@ -332,7 +439,7 @@ export function createApp(
     }
     const credit = paidCredit(session);
     if (!credit || credit.userId !== user.id) throw new HttpError(400, "That payment isn't complete yet.");
-    const result = await store.credit(user.id, credit.id, credit.cents);
+    const result = await store.credit(user.id, credit.id, credit.cents, credit.paymentIntent);
     sendJson(res, 200, { ...result, cents: credit.cents });
   }
 
@@ -351,7 +458,9 @@ export function createApp(
     }
     if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
       const credit = paidCredit(event.data?.object);
-      if (credit && (await store.getUser(credit.userId))) await store.credit(credit.userId, credit.id, credit.cents);
+      if (credit && (await store.getUser(credit.userId))) {
+        await store.credit(credit.userId, credit.id, credit.cents, credit.paymentIntent);
+      }
     }
     sendJson(res, 200, { received: true });
   }
@@ -495,6 +604,19 @@ export function createApp(
           return await handleConfirm(req, res);
         case 'POST /api/billing/webhook':
           return await handleWebhook(req, res);
+        case 'POST /api/auth/forgot':
+          return await handleForgot(req, res);
+        case 'POST /api/auth/reset':
+          return await handleReset(req, res);
+        case 'GET /api/admin/users':
+          await requireAdmin(req);
+          return sendJson(res, 200, { users: await store.listUsers(url.searchParams.get('q') || '') });
+        case 'GET /api/admin/user':
+          return await handleAdminUser(req, res, url.searchParams.get('id'));
+        case 'POST /api/admin/credit':
+          return await handleAdminCredit(req, res);
+        case 'POST /api/admin/refund':
+          return await handleAdminRefund(req, res);
         case 'GET /api/settings':
           requireLocal(req);
           return sendJson(res, 200, { variables: settingsSummary() });

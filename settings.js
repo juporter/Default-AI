@@ -78,6 +78,13 @@ function validate(name, value) {
   if (name === 'BILLING_TOPUP_AMOUNTS' && !/^\d{1,4}(\.\d{1,2})?(,\s*\d{1,4}(\.\d{1,2})?)*$/.test(value)) {
     return 'BILLING_TOPUP_AMOUNTS must be dollar amounts separated by commas, such as 5,10,25.';
   }
+  if (name === 'ADMIN_EMAILS' && !value.split(',').every((e) => /^[^\s@,]+@[^\s@,]+\.[^\s@,]+$/.test(e.trim()))) {
+    return 'ADMIN_EMAILS must be email addresses separated by commas.';
+  }
+  if (name === 'RESEND_API_KEY' && !/^re_[A-Za-z0-9_]+$/.test(value)) return 'RESEND_API_KEY must start with re_.';
+  if (name === 'EMAIL_FROM' && !/^([^<>]*<)?[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+>?$/.test(value)) {
+    return 'EMAIL_FROM must be an address such as "Default AI <billing@example.com>".';
+  }
   if (name === 'PUBLIC_URL' && !/^https?:\/\/[^\s/]+(\/[^\s]*)?$/i.test(value)) return 'PUBLIC_URL must be an http(s) URL.';
   if (value.includes("'") && /["\\]/.test(value)) return `${name} contains characters that can't be saved.`;
   return null;

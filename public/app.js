@@ -6,10 +6,11 @@ import { setupAds } from './ads.js';
 import { initHistory, showHistory, markHistoryStale } from './history.js';
 import { initSettings, showSettings } from './settings-view.js';
 import * as account from './account.js';
+import { initAdmin, setAdminVisible, showAdmin } from './admin.js';
 
 const STORAGE_KEY = 'multi-llm:prefs:v1';
 const CUSTOM = '__custom__';
-const VIEWS = ['compare', 'history', 'settings', 'account'];
+const VIEWS = ['compare', 'history', 'settings', 'account', 'admin'];
 
 const els = {
   providerList: $('#provider-list'),
@@ -66,7 +67,9 @@ function savePrefs() {
 
 function showView() {
   const requested = location.hash.slice(1);
-  const available = account.billingEnabled() ? VIEWS : VIEWS.filter((v) => v !== 'account');
+  const available = VIEWS.filter(
+    (v) => (v !== 'account' || account.billingEnabled()) && (v !== 'admin' || account.isAdmin()),
+  );
   const name = available.includes(requested) ? requested : 'compare';
   for (const view of VIEWS) {
     $(`#view-${view}`).hidden = view !== name;
@@ -77,6 +80,7 @@ function showView() {
   if (name === 'history') showHistory();
   if (name === 'settings') showSettings();
   if (name === 'account') account.showAccount();
+  if (name === 'admin') showAdmin();
 }
 
 // ---------------------------------------------------------------------------
@@ -534,8 +538,16 @@ async function init() {
     return;
   }
 
+  initAdmin();
   account.initAccount(
-    { getProviders: () => state.providers, onChange: updateSendButton },
+    {
+      getProviders: () => state.providers,
+      onChange: () => {
+        updateSendButton();
+        setAdminVisible(account.isAdmin());
+        if (location.hash === '#admin' && !account.isAdmin()) location.hash = '#account';
+      },
+    },
     state.config.billing,
   );
   await account.loadAccount();

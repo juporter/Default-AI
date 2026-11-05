@@ -1239,3 +1239,92 @@ button.primary.small {
   font-variant-numeric: tabular-nums;
   color: var(--muted);
 }
+
+/* Password reset and admin */
+
+button.link-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--primary);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.account-actions button.link-button {
+  margin-left: auto;
+  align-self: center;
+}
+
+.admin-search {
+  font: inherit;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  width: min(260px, 100%);
+}
+
+.admin-users tr.selected td {
+  background: var(--surface-2);
+}
+
+.usage-table td.negative {
+  color: var(--error);
+}
+
+#admin-detail h3 {
+  margin: 20px 0 8px;
+  font-size: 1rem;
+}
+
+.admin-credit {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.admin-credit-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.admin-credit-row input,
+.refund-confirm input {
+  font: inherit;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.admin-credit-row input[type="number"] {
+  width: 110px;
+}
+
+.admin-credit-row input[type="text"] {
+  flex: 1 1 200px;
+  min-width: 0;
+}
+
+.refund-confirm {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.refund-confirm input {
+  width: 90px;
+}
+
+/* Five tabs don't fit on a phone: let them wrap instead of widening the page. */
+.tabs {
+  flex-wrap: wrap;
+  max-width: 100%;
+}
