@@ -89,7 +89,7 @@ If you host the app for other people, billing lets them pay for what they use in
 - **Visitors need an account** (email and password) to send prompts. The **Account** tab shows their balance, every answer's tokens and cost, and the price list.
 - **Credit is prepaid.** Users top up with **Add $5 / $10 / $25** on Stripe Checkout. Prompts are refused once the balance reaches zero.
 - **Each answer is charged** from the token counts the provider reports: `(input tokens × input price + output tokens × output price) × (1 + markup)`. If a provider doesn't report tokens, they are estimated at 4 characters per token and marked as estimated.
-- **Only priced models can be used.** Prices live in `pricing.json`, in US dollars per million tokens. Copy `pricing.example.json` to `pricing.json` and **replace the placeholder numbers with each provider's current prices**. Perplexity also charges per search, so price its models with that in mind.
+- **Only priced models can be used.** Prices live in `pricing.json`, in US dollars per million tokens. It ships with the providers' list prices as of November 2026, with sources noted in the file. Where a provider has cheaper off-peak, promotional or short-prompt rates, the file uses the higher standard rate. Providers change prices, so check it now and then.
 
 | Variable | Purpose |
 | --- | --- |

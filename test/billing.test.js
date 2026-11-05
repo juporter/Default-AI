@@ -21,6 +21,7 @@ import {
   verifyPassword,
 } from '../billing.js';
 import { parseSettingsText, maskValue } from '../settings.js';
+import { PROVIDERS } from '../providers.js';
 
 // --- Unit tests -------------------------------------------------------------
 
@@ -38,9 +39,10 @@ test('pricing.json is parsed and checked', () => {
   assert.deepEqual([...prices], [['openai/a', { input: 3, output: 15 }]]);
   assert.throws(() => parsePricing('{"openai":{"a":{"input":-1,"output":1}}}'), /input/);
   assert.throws(() => parsePricing('[]'), /object/);
-  // The example file shipped with the app must parse.
-  const example = parsePricing(readFileSync(new URL('../pricing.example.json', import.meta.url), 'utf8'));
-  assert.ok(example.size > 10);
+  // The price list shipped with the app must parse and price every suggested model.
+  const shipped = parsePricing(readFileSync(new URL('../pricing.json', import.meta.url), 'utf8'));
+  for (const p of PROVIDERS) for (const m of p.models) assert.ok(shipped.has(`${p.id}/${m}`), `${p.id}/${m} has no price`);
+  for (const p of PROVIDERS) assert.ok(shipped.has(`${p.id}/${p.defaultModel}`));
 });
 
 test('cost is exact micro-dollars with the markup, rounded up', () => {
