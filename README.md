@@ -79,8 +79,29 @@ With `ADSENSE_CLIENT` set, the app also serves `/ads.txt` for you, and it switch
 **Before you rely on ads, note:**
 
 - **AdSense only shows ads on a public website** that Google has reviewed and approved. On `127.0.0.1` the spaces load but stay empty. To earn from ads you need to host the app on your own domain and add that site in your AdSense account.
-- **Hosting the app publicly means visitors use your API keys.** Every prompt anyone sends is billed to your accounts with OpenAI, Anthropic and the rest. Before going public, put the app behind a login, add rate limits and set spending caps with each provider.
+- **Hosting the app publicly means visitors use your API keys.** Every prompt anyone sends is billed to your accounts with OpenAI, Anthropic and the rest. Before going public, turn on [billing](#billing-charge-users-for-tokens) so users pay for their usage, and set spending caps with each provider.
 - To host it, set `HOST=0.0.0.0` and run it behind an HTTPS reverse proxy. Settings import stays limited to the server itself.
+
+### Billing (charge users for tokens)
+
+If you host the app for other people, billing lets them pay for what they use instead of spending your API credit. It is off until you set `STRIPE_SECRET_KEY`. When it's on:
+
+- **Visitors need an account** (email and password) to send prompts. The **Account** tab shows their balance, every answer's tokens and cost, and the price list.
+- **Credit is prepaid.** Users top up with **Add $5 / $10 / $25** on Stripe Checkout. Prompts are refused once the balance reaches zero.
+- **Each answer is charged** from the token counts the provider reports: `(input tokens × input price + output tokens × output price) × (1 + markup)`. If a provider doesn't report tokens, they are estimated at 4 characters per token and marked as estimated.
+- **Only priced models can be used.** Prices live in `pricing.json`, in US dollars per million tokens. It ships with the providers' list prices as of November 2026, with sources noted in the file. Where a provider has cheaper off-peak, promotional or short-prompt rates, the file uses the higher standard rate. Providers change prices, so check it now and then.
+
+| Variable | Purpose |
+| --- | --- |
+| `STRIPE_SECRET_KEY` | Your Stripe secret key (`sk_test_…` while testing). Turns billing on. |
+| `STRIPE_WEBHOOK_SECRET` | Signing secret of a webhook endpoint at `https://your-site/api/billing/webhook` listening for `checkout.session.completed` and `checkout.session.async_payment_succeeded`. Optional: payments are also credited when the user returns from Checkout, but the webhook covers users who close the tab. |
+| `BILLING_MARKUP_PERCENT` | Added on top of provider prices (default 20). |
+| `BILLING_TOPUP_AMOUNTS` | Top-up amounts in dollars (default `5,10,25`). |
+| `PUBLIC_URL` | Your site's address, for Stripe's return links. Defaults to the address the browser used. |
+
+Accounts, balances and usage are kept in `data/billing.json` (passwords are hashed with scrypt; session tokens are stored hashed). Back this file up: it is the record of what users have paid for. It suits a small site; move to a database before you have many thousands of users.
+
+A user who sends to several models at once can go slightly below zero, because every answer in that batch is charged after it arrives. The next prompt is then refused until they top up.
 
 ## How it works
 
@@ -92,6 +113,7 @@ browser ──► server.js ──► OpenAI / Anthropic / Meta / Google / xAI /
 
 - `providers.js` describes each provider and converts between the app's format and each API. OpenAI, Meta, Grok, DeepSeek and Kimi use the OpenAI Chat Completions format. Claude uses the Anthropic Messages API. Gemini uses `generateContent`. Perplexity uses its Agent API with web search turned on.
 - `settings.js` reads, checks and saves imported settings files, and holds the ad settings.
+- `billing.js` holds accounts, pricing, charges and the Stripe calls (plain `fetch`, no Stripe SDK).
 - `public/` holds the UI: plain HTML, CSS and JavaScript with no build step. `public/importers.js` reads chat exports (including .zip files) in the browser, and `public/store.js` keeps History in the browser's IndexedDB.
 
 ## Configuration
@@ -107,6 +129,7 @@ Everything goes in `.env`, either edited by hand or through **Settings → Impor
 | `REQUEST_TIMEOUT_MS` | How long to wait for each provider (default 120000) |
 | `HOST` / `PORT` | Where the app listens (default `127.0.0.1:3000`) |
 | `ADSENSE_*`, `ADS_PLACEHOLDER` | Ads, see above |
+| `STRIPE_*`, `BILLING_*`, `PUBLIC_URL` | Billing, see above |
 
 `<PROVIDER>` is one of `OPENAI`, `ANTHROPIC`, `META`, `GEMINI`, `XAI`, `DEEPSEEK`, `PERPLEXITY` or `KIMI`.
 
@@ -135,4 +158,4 @@ Once the key is set, the model dropdown lists that host's models.
 npm test
 ```
 
-The tests check the request and response conversion for every provider, the chat-export importers (including real .zip files), settings import, the Markdown renderer's escaping, and the whole server. The server tests run against a fake provider, so no API keys are needed.
+The tests check the request and response conversion for every provider, the chat-export importers (including real .zip files), settings import, the Markdown renderer's escaping, billing (pricing maths, Stripe signatures, and sign-up → top-up → charge through the server against a fake Stripe), and the whole server. The server tests run against a fake provider, so no API keys are needed.

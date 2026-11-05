@@ -1176,3 +1176,66 @@ button.primary.small {
   display: flex;
   gap: 8px;
 }
+
+/* Billing: account, balance and prices */
+
+.nav-balance:not(:empty) {
+  margin-left: 4px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+}
+
+.account-form {
+  display: grid;
+  gap: 8px;
+  max-width: 420px;
+}
+
+.account-form h2 {
+  margin: 0;
+}
+
+.account-form input {
+  width: 100%;
+  font: inherit;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.account-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.balance {
+  margin: 4px 0 8px;
+  font-size: 2rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.balance.empty-balance {
+  color: var(--error);
+}
+
+.usage-table th.num,
+.usage-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.model-price {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.card-footer .cost {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}

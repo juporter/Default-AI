@@ -5,10 +5,11 @@ import * as store from './store.js';
 import { setupAds } from './ads.js';
 import { initHistory, showHistory, markHistoryStale } from './history.js';
 import { initSettings, showSettings } from './settings-view.js';
+import * as account from './account.js';
 
 const STORAGE_KEY = 'multi-llm:prefs:v1';
 const CUSTOM = '__custom__';
-const VIEWS = ['compare', 'history', 'settings'];
+const VIEWS = ['compare', 'history', 'settings', 'account'];
 
 const els = {
   providerList: $('#provider-list'),
@@ -34,6 +35,7 @@ const state = {
   prefs: loadPrefs(),
   models: {}, // provider id -> string[] loaded from the provider
   attachments: [], // {name, size, text}
+  config: { billing: { enabled: false } },
 };
 
 // ---------------------------------------------------------------------------
@@ -64,7 +66,8 @@ function savePrefs() {
 
 function showView() {
   const requested = location.hash.slice(1);
-  const name = VIEWS.includes(requested) ? requested : 'compare';
+  const available = account.billingEnabled() ? VIEWS : VIEWS.filter((v) => v !== 'account');
+  const name = available.includes(requested) ? requested : 'compare';
   for (const view of VIEWS) {
     $(`#view-${view}`).hidden = view !== name;
     const link = $(`#nav-${view}`);
@@ -73,6 +76,7 @@ function showView() {
   }
   if (name === 'history') showHistory();
   if (name === 'settings') showSettings();
+  if (name === 'account') account.showAccount();
 }
 
 // ---------------------------------------------------------------------------
@@ -80,7 +84,7 @@ function showView() {
 // ---------------------------------------------------------------------------
 
 function isSelected(p) {
-  if (!p.configured) return false;
+  if (!usable(p)) return false;
   // First visit: select every provider that has a key.
   if (!Array.isArray(state.prefs.selected)) return true;
   return state.prefs.selected.includes(p.id);
@@ -95,7 +99,19 @@ function setSelected(p, selected) {
 }
 
 function currentModel(p) {
-  return (state.prefs.models[p.id] || '').trim() || p.defaultModel;
+  const chosen = (state.prefs.models[p.id] || '').trim() || p.defaultModel;
+  if (!account.billingEnabled() || account.priceOf(p.id, chosen)) return chosen;
+  // With billing on, fall back to a model that has a price.
+  return pricedModels(p)[0] || chosen;
+}
+
+/** With billing on, only models with a price can be used. */
+function pricedModels(p) {
+  return account.billingEnabled() ? (state.config.billing.prices || []).filter((x) => x.provider === p.id).map((x) => x.model) : [];
+}
+
+function usable(p) {
+  return p.configured && (!account.billingEnabled() || pricedModels(p).length > 0);
 }
 
 function renderProviders() {
@@ -108,7 +124,7 @@ function providerCard(p) {
     type: 'checkbox',
     id: `pick-${p.id}`,
     checked: isSelected(p),
-    disabled: !p.configured,
+    disabled: !usable(p),
     'aria-describedby': `status-${p.id}`,
     onchange: () => {
       setSelected(p, checkbox.checked);
@@ -119,7 +135,7 @@ function providerCard(p) {
 
   const card = h(
     'div',
-    { class: `provider${isSelected(p) ? ' selected' : ''}${p.configured ? '' : ' unconfigured'}`, 'data-provider': p.id },
+    { class: `provider${isSelected(p) ? ' selected' : ''}${usable(p) ? '' : ' unconfigured'}`, 'data-provider': p.id },
     h(
       'label',
       { class: 'provider-toggle' },
@@ -127,15 +143,17 @@ function providerCard(p) {
       h('span', { class: 'provider-dot', 'aria-hidden': 'true' }),
       h('span', { class: 'provider-name' }, p.name, h('span', { class: 'provider-vendor', text: p.vendor !== p.name ? p.vendor : '' })),
       h('span', {
-        class: `status ${p.configured ? 'ready' : 'missing'}`,
+        class: `status ${usable(p) ? 'ready' : 'missing'}`,
         id: `status-${p.id}`,
-        text: p.configured ? 'Ready' : 'No key',
+        text: !p.configured ? 'No key' : usable(p) ? 'Ready' : 'No prices',
       }),
     ),
   );
 
-  if (p.configured) {
+  if (usable(p)) {
     card.append(modelPicker(p));
+  } else if (p.configured) {
+    card.append(h('p', { class: 'setup', text: 'None of this provider’s models has a price yet.' }));
   } else {
     card.append(
       h(
@@ -169,7 +187,16 @@ function modelPicker(p) {
   });
   const meta = h('span', { class: 'model-meta', 'aria-live': 'polite' });
 
+  const billed = account.billingEnabled();
+  const showPrice = () => {
+    if (!billed) return;
+    const price = account.priceOf(p.id, select.value);
+    priceLine.textContent = price ? account.describePrice(price) : '';
+  };
+  const priceLine = h('span', { class: 'model-price' });
+
   select.addEventListener('change', () => {
+    showPrice();
     if (select.value === CUSTOM) {
       custom.hidden = false;
       custom.value = currentModel(p);
@@ -184,18 +211,24 @@ function modelPicker(p) {
 
   const fillOptions = (listed) => {
     const chosen = currentModel(p);
-    const ids = [...new Set([p.defaultModel, chosen, ...(listed || p.models || [])])].sort((a, b) =>
-      a === p.defaultModel ? -1 : b === p.defaultModel ? 1 : a.localeCompare(b),
-    );
+    let ids = [...new Set([p.defaultModel, chosen, ...(listed || p.models || [])])];
+    // With billing on, only priced models can be chosen (and no free-typed IDs).
+    if (billed) ids = pricedModels(p);
+    ids.sort((a, b) => (a === p.defaultModel ? -1 : b === p.defaultModel ? 1 : a.localeCompare(b)));
     select.replaceChildren(
       ...ids.map((id) => h('option', { value: id, text: id === p.defaultModel ? `${id} (default)` : id })),
-      h('option', { value: CUSTOM, text: 'Other model ID…' }),
+      billed ? null : h('option', { value: CUSTOM, text: 'Other model ID…' }),
     );
     select.value = chosen;
+    showPrice();
   };
   fillOptions(state.models[p.id]);
 
   const load = async () => {
+    if (billed) {
+      meta.textContent = `${select.options.length} model${select.options.length === 1 ? '' : 's'} available`;
+      return;
+    }
     meta.textContent = 'Loading models…';
     meta.title = '';
     meta.className = 'model-meta';
@@ -214,7 +247,7 @@ function modelPicker(p) {
   };
   load();
 
-  return h('div', { class: 'model-row' }, select, custom, meta);
+  return h('div', { class: 'model-row' }, select, custom, meta, billed ? priceLine : null);
 }
 
 /** Reflect state.prefs.selected in the checkboxes without rebuilding the cards. */
@@ -234,6 +267,11 @@ function selectedProviders() {
 
 function updateSendButton() {
   const n = selectedProviders().length;
+  if (account.billingEnabled() && !account.signedIn()) {
+    els.send.disabled = false;
+    els.send.textContent = 'Sign in to send';
+    return;
+  }
   els.send.disabled = n === 0;
   els.send.textContent = n === 0 ? 'Select a model' : `Send to ${n} model${n === 1 ? '' : 's'}`;
 }
@@ -298,6 +336,10 @@ function newId() {
 
 async function sendPrompt(event) {
   event.preventDefault();
+  if (account.billingEnabled() && !account.signedIn()) {
+    location.hash = '#account';
+    return;
+  }
   const prompt = els.prompt.value;
   if (!prompt.trim()) {
     els.prompt.focus();
@@ -367,7 +409,8 @@ async function askProvider(p, model, prompt, system, card, signal) {
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
     const seconds = card.elapsed();
-    card.succeed({ ...data, seconds });
+    card.succeed({ ...data, seconds, costText: typeof data.cost === 'number' ? account.formatMoney(data.cost) : '' });
+    account.updateBalance(data.balance);
     return {
       ...base,
       model: data.model || model,
@@ -377,6 +420,7 @@ async function askProvider(p, model, prompt, system, card, signal) {
       usage: data.usage || {},
       stopReason: data.stopReason || '',
       sources: data.sources || [],
+      ...(typeof data.cost === 'number' ? { cost: data.cost } : {}),
     };
   } catch (err) {
     const message = err.name === 'AbortError' ? 'Cancelled' : err.message || 'Request failed';
@@ -407,10 +451,13 @@ function showNotice(message) {
   els.notice.hidden = false;
 }
 
-function onSettingsApplied({ providers, adsChanged }) {
+function onSettingsApplied({ providers, adsChanged, billing }) {
   state.providers = providers;
   renderProviders();
   if (adsChanged) showNotice('Ad settings changed. Reload the page to see them.');
+  else if (billing && billing.enabled !== account.billingEnabled()) {
+    showNotice('Billing settings changed. Reload the page to see them.');
+  }
 }
 
 async function init() {
@@ -478,11 +525,20 @@ async function init() {
     const [providersRes, configRes] = await Promise.all([fetch('/api/providers'), fetch('/api/config')]);
     if (!providersRes.ok) throw new Error(`HTTP ${providersRes.status}`);
     state.providers = (await providersRes.json()).providers;
-    if (configRes.ok) setupAds((await configRes.json()).ads);
+    if (configRes.ok) {
+      state.config = await configRes.json();
+      setupAds(state.config.ads);
+    }
   } catch (err) {
     showNotice(`Could not reach the server (${err.message}). Is "npm start" running?`);
     return;
   }
+
+  account.initAccount(
+    { getProviders: () => state.providers, onChange: updateSendButton },
+    state.config.billing,
+  );
+  await account.loadAccount();
 
   renderProviders();
   showView();

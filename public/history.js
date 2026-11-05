@@ -6,6 +6,7 @@ import { createCard } from './cards.js';
 import { renderMarkdown } from './markdown.js';
 import * as store from './store.js';
 import { readImportFile, buildAppExport, SOURCES } from './importers.js';
+import { formatMoney } from './account.js';
 
 const MAX_LISTED = 300;
 
@@ -195,7 +196,7 @@ function renderDetail(entry) {
           const provider = deps.providerById(r.provider) || { id: r.provider, name: r.providerName || r.provider };
           const card = createCard(provider, r.model, { live: false });
           if (r.error) card.fail(r.error);
-          else card.succeed(r);
+          else card.succeed({ ...r, costText: typeof r.cost === 'number' ? formatMoney(r.cost) : '' });
           return card.el;
         }),
       ),
