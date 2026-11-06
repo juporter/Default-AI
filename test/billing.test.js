@@ -193,6 +193,7 @@ before(async () => {
       STRIPE_API_BASE: `${up}/stripe`,
       BILLING_MARKUP_PERCENT: '20',
       ADMIN_EMAILS: 'boss@example.com',
+      CLIENT_IP_HEADER: 'fly-client-ip',
       RESEND_API_KEY: 're_test',
       RESEND_API_BASE: `${up}/resend`,
       EMAIL_FROM: 'Default AI <billing@example.com>',
@@ -488,4 +489,12 @@ test('sign-in, sign-up and reset requests are rate-limited', async () => {
   }
   assert.equal(status, 429);
   assert.equal((await post('/api/auth/forgot', { email: 'ada@example.com' })).status, 429);
+
+  // Behind a proxy (CLIENT_IP_HEADER), each visitor has their own limit.
+  const res = await fetch(`${base}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'fly-client-ip': '203.0.113.9' },
+    body: JSON.stringify({ email: 'ada@example.com', password: 'brand new password' }),
+  });
+  assert.equal(res.status, 200);
 });

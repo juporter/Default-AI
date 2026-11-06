@@ -250,7 +250,7 @@ export function createApp(
   }
 
   function limitAuth(req) {
-    const ip = req.socket.remoteAddress || '';
+    const ip = clientIp(req, env.CLIENT_IP_HEADER);
     const now = Date.now();
     const entry = authAttempts.get(ip);
     if (!entry || now - entry.since > AUTH_WINDOW_MS) {
@@ -687,6 +687,17 @@ function readCookie(req, name) {
     if (eq > 0 && part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
   }
   return '';
+}
+
+/**
+ * The visitor's address. Behind a hosting proxy every request comes from the
+ * proxy, so CLIENT_IP_HEADER (e.g. "fly-client-ip") names the header the proxy
+ * puts the real address in. Only set it when a proxy you trust always sets it.
+ */
+function clientIp(req, headerName = '') {
+  const header = headerName.toLowerCase();
+  const forwarded = header && String(req.headers[header] || '').split(',')[0].trim();
+  return forwarded || req.socket.remoteAddress || '';
 }
 
 function isHttps(req) {
