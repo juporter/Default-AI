@@ -1,0 +1,9 @@
+# Keep secrets, local data and dev files out of the image.
+.env
+.env.*
+!.env.example
+data/
+node_modules/
+.git/
+test/
+*.log

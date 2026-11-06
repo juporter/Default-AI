@@ -52,7 +52,6 @@ import {
   pricingList,
   costMicros,
   estimateTokens,
-  BillingStore,
   verifyPassword,
   EMAIL_RE,
   SESSION_COOKIE,
@@ -64,12 +63,13 @@ import {
   emailConfigured,
   sendResetEmail,
 } from './billing.js';
+import { BillingStore } from './billing-store.js';
 
 const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(APP_DIR, 'public');
 const DEFAULT_ENV_FILE = path.join(APP_DIR, '.env');
 const DEFAULT_PRICING_FILE = path.join(APP_DIR, 'pricing.json');
-const DEFAULT_BILLING_FILE = path.join(APP_DIR, 'data', 'billing.json');
+const DEFAULT_BILLING_FILE = path.join(APP_DIR, 'data', 'billing.db');
 const AUTH_WINDOW_MS = 15 * 60 * 1000;
 const AUTH_MAX_ATTEMPTS = 10;
 // Large enough for a prompt with attached files (the browser caps attachments at 2 MB).
@@ -250,7 +250,7 @@ export function createApp(
   }
 
   function limitAuth(req) {
-    const ip = req.socket.remoteAddress || '';
+    const ip = clientIp(req, env.CLIENT_IP_HEADER);
     const now = Date.now();
     const entry = authAttempts.get(ip);
     if (!entry || now - entry.since > AUTH_WINDOW_MS) {
@@ -687,6 +687,17 @@ function readCookie(req, name) {
     if (eq > 0 && part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
   }
   return '';
+}
+
+/**
+ * The visitor's address. Behind a hosting proxy every request comes from the
+ * proxy, so CLIENT_IP_HEADER (e.g. "fly-client-ip") names the header the proxy
+ * puts the real address in. Only set it when a proxy you trust always sets it.
+ */
+function clientIp(req, headerName = '') {
+  const header = headerName.toLowerCase();
+  const forwarded = header && String(req.headers[header] || '').split(',')[0].trim();
+  return forwarded || req.socket.remoteAddress || '';
 }
 
 function isHttps(req) {
