@@ -19,6 +19,71 @@ let app;
 let base;
 const seen = []; // requests the fake provider received
 
+/** Send server-sent events, a few milliseconds apart. */
+function sseOut(res, events) {
+  res.writeHead(200, { 'content-type': 'text/event-stream' });
+  let i = 0;
+  const next = () => {
+    if (i >= events.length) return res.end();
+    const e = events[i++];
+    res.write((e.event ? `event: ${e.event}\n` : '') + `data: ${typeof e.data === 'string' ? e.data : JSON.stringify(e.data)}\n\n`);
+    setTimeout(next, 2);
+  };
+  next();
+}
+
+const lastText = (json) =>
+  json.messages?.at(-1)?.content ?? json.contents?.at(-1)?.parts?.[0]?.text ?? (Array.isArray(json.input) ? json.input.at(-1).content : json.input);
+
+function streamFake(res, prefix, url, json) {
+  const text = `${prefix} streams: ${lastText(json)}`;
+  const pieces = text.split(/(?<= )/); // word by word
+  if (json.model === 'broken-stream') {
+    return sseOut(res, [{ data: { choices: [{ delta: { content: 'Partial ' } }] } }, { data: { error: { message: 'stream interrupted' } } }]);
+  }
+  if (url.endsWith('/chat/completions')) {
+    return sseOut(res, [
+      ...pieces.map((t) => ({ data: { model: json.model, choices: [{ delta: { content: t } }] } })),
+      { data: { model: json.model, choices: [{ delta: {}, finish_reason: 'stop' }] } },
+      // Usage only when asked for (Meta isn't asked, so it gets none).
+      ...(json.stream_options?.include_usage ? [{ data: { model: json.model, choices: [], usage: { prompt_tokens: 10, completion_tokens: 5 } } }] : []),
+      { data: '[DONE]' },
+    ]);
+  }
+  if (url === '/anthropic/v1/messages') {
+    return sseOut(res, [
+      { event: 'message_start', data: { type: 'message_start', message: { model: json.model, usage: { input_tokens: 11, output_tokens: 1 } } } },
+      ...pieces.map((t) => ({ event: 'content_block_delta', data: { type: 'content_block_delta', delta: { type: 'text_delta', text: t } } })),
+      { event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 6 } } },
+      { event: 'message_stop', data: { type: 'message_stop' } },
+    ]);
+  }
+  if (url.includes(':streamGenerateContent')) {
+    return sseOut(res, [
+      ...pieces.map((t) => ({ data: { candidates: [{ content: { parts: [{ text: t }] } }] } })),
+      { data: { modelVersion: 'gemini-test-001', candidates: [{ finishReason: 'STOP' }], usageMetadata: { promptTokenCount: 12, candidatesTokenCount: 7 } } },
+    ]);
+  }
+  if (url === '/perplexity/agent') {
+    return sseOut(res, [
+      ...pieces.map((t) => ({ data: { type: 'response.output_text.delta', delta: t } })),
+      {
+        data: {
+          type: 'response.completed',
+          response: {
+            model: json.model,
+            status: 'completed',
+            output: [{ type: 'search_results', results: [{ title: 'Source A', url: 'https://a.example' }] }],
+            usage: { input_tokens: 13, output_tokens: 8 },
+          },
+        },
+      },
+    ]);
+  }
+  res.writeHead(404);
+  res.end();
+}
+
 function fakeProvider(req, res) {
   let body = '';
   req.on('data', (c) => (body += c));
@@ -32,6 +97,11 @@ function fakeProvider(req, res) {
     const [, prefix] = req.url.split('/');
 
     if (json.model === 'missing-model') return send(404, { error: { message: 'model not found' } });
+
+    // Streaming, in each provider's own wire format.
+    if (json.stream === true || req.url.includes(':streamGenerateContent')) {
+      return streamFake(res, prefix, req.url, json);
+    }
     if (json.model === 'slow-model') return setTimeout(() => send(200, {}), 2000);
 
     if (req.method === 'GET' && req.url.startsWith(`/${prefix}/models`) && prefix !== 'gemini') {
@@ -367,4 +437,161 @@ test('ads: AdSense on adds a nonce to scripts, Google strict CSP and ads.txt', a
   } finally {
     adsApp.close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Streaming, follow-up questions and cost estimates
+// ---------------------------------------------------------------------------
+
+/** POST /api/chat with stream: true and return the parsed events. */
+async function streamChat(body) {
+  const res = await fetch(`${base}/api/chat`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...body, stream: true }),
+  });
+  if (!res.ok) return { status: res.status, error: (await res.json()).error };
+  assert.match(res.headers.get('content-type'), /application\/x-ndjson/);
+  const events = (await res.text()).trim().split('\n').map((line) => JSON.parse(line));
+  return { status: res.status, events, done: events.find((e) => e.type === 'done') };
+}
+
+test('streams answers from every provider, piece by piece', async () => {
+  for (const provider of ['openai', 'meta', 'deepseek', 'kimi', 'anthropic', 'gemini', 'perplexity']) {
+    const { events, done } = await streamChat({ provider, model: 'test-model', prompt: 'tell me more' });
+    const deltas = events.filter((e) => e.type === 'delta');
+    assert.ok(deltas.length > 2, `${provider} sent the answer in pieces`);
+    const expectedPrefix = provider === 'anthropic' ? 'anthropic' : provider;
+    assert.equal(deltas.map((d) => d.text).join(''), `${expectedPrefix} streams: tell me more`, provider);
+    assert.equal(done.text, `${expectedPrefix} streams: tell me more`, provider);
+    assert.equal(typeof done.latencyMs, 'number');
+  }
+  const { done: claude } = await streamChat({ provider: 'anthropic', prompt: 'x' });
+  assert.deepEqual(claude.usage, { input: 11, output: 6 });
+  assert.equal(claude.stopReason, 'end_turn');
+  const { done: pplx } = await streamChat({ provider: 'perplexity', prompt: 'x' });
+  assert.deepEqual(pplx.sources, [{ title: 'Source A', url: 'https://a.example' }]);
+});
+
+test('cost estimate (billing off) from token counts, or from length when none are reported', async () => {
+  // gpt-6-astra lists at $10 in / $50 out per 1M tokens: 10 × 10 + 5 × 50 = 350 millionths of a dollar.
+  const { done } = await streamChat({ provider: 'openai', model: 'gpt-6-astra', prompt: 'x' });
+  assert.equal(done.estimatedCost, 350);
+  assert.equal(done.costEstimated, undefined);
+  assert.equal(done.cost, undefined, 'no charge without billing');
+  const plain = await (await chat({ provider: 'openai', model: 'gpt-6-astra', prompt: 'x' })).json();
+  assert.equal(plain.estimatedCost, 350);
+
+  // Meta isn't asked for token counts in a stream, so they're estimated from the text.
+  const { done: meta } = await streamChat({ provider: 'meta', model: 'muse-spark-1.3', prompt: 'x' });
+  assert.equal(meta.costEstimated, true);
+  assert.ok(meta.estimatedCost > 0);
+
+  // A model without a list price gets no estimate.
+  const { done: unpriced } = await streamChat({ provider: 'openai', model: 'test-model', prompt: 'x' });
+  assert.equal(unpriced.estimatedCost, undefined);
+});
+
+test('a stream that breaks off reports an error after the text so far', async () => {
+  const { events } = await streamChat({ provider: 'openai', model: 'broken-stream', prompt: 'x' });
+  assert.deepEqual(events[0], { type: 'delta', text: 'Partial ' });
+  assert.equal(events.at(-1).type, 'error');
+  assert.match(events.at(-1).error, /stream interrupted/);
+});
+
+test('a provider error before the stream starts is a normal error response', async () => {
+  const { status, error } = await streamChat({ provider: 'openai', model: 'missing-model', prompt: 'x' });
+  assert.equal(status, 502);
+  assert.equal(error, 'HTTP 404: model not found');
+});
+
+test('follow-up questions send the whole conversation to each provider', async () => {
+  const messages = [
+    { role: 'user', content: 'First question' },
+    { role: 'assistant', content: 'First answer' },
+    { role: 'user', content: 'And a follow-up?' },
+  ];
+  seen.length = 0;
+  for (const provider of ['openai', 'anthropic', 'gemini', 'perplexity']) {
+    const { done } = await streamChat({ provider, model: 'test-model', messages, system: 'Be brief' });
+    assert.match(done.text, /And a follow-up\?$/, provider);
+  }
+  const body = (url) => seen.find((r) => r.url.startsWith(url)).json;
+  assert.deepEqual(body('/openai/chat/completions').messages, [{ role: 'system', content: 'Be brief' }, ...messages]);
+  assert.deepEqual(body('/anthropic/v1/messages').messages, messages);
+  assert.deepEqual(
+    body('/gemini/models/').contents.map((c) => c.role),
+    ['user', 'model', 'user'],
+  );
+  assert.deepEqual(
+    body('/perplexity/agent').input.map((m) => [m.type, m.role]),
+    [
+      ['message', 'user'],
+      ['message', 'assistant'],
+      ['message', 'user'],
+    ],
+  );
+
+  // The conversation must end with the user's question.
+  const bad = await chat({ provider: 'openai', messages: messages.slice(0, 2) });
+  assert.equal(bad.status, 400);
+});
+
+// ---------------------------------------------------------------------------
+// PDF and Word attachments
+// ---------------------------------------------------------------------------
+
+const fixture = (name) => readFileSync(new URL(`./fixtures/${name}`, import.meta.url));
+const extract = (name, type) =>
+  fetch(`${base}/api/extract`, {
+    method: 'POST',
+    headers: { 'content-type': type, 'x-file-name': encodeURIComponent(name) },
+    body: fixture(name),
+  });
+const PDF = 'application/pdf';
+const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+
+test('extracts text from a PDF', async () => {
+  const res = await extract('report.pdf', PDF);
+  assert.equal(res.status, 200);
+  const data = await res.json();
+  assert.equal(data.pages, 2);
+  assert.match(data.text, /^Quarterly Report\nRevenue grew 12% to \$4\.2M\. Café sales led the gain\./);
+  assert.match(data.text, /Owner: Zoë Martín\n\nPage two/);
+});
+
+test('extracts text from Word files made by pandoc and LibreOffice', async () => {
+  let data = await (await extract('memo.docx', DOCX)).json();
+  assert.equal(
+    data.text,
+    'Team memo\nHello team, here are the notes & numbers for “Q4”.\nFirst item\nSecond item\nRegion\tSales\nNorth\t120\nSouth\t95\nThanks, Zoë',
+  );
+  data = await (await extract('letter.docx', 'application/octet-stream')).json();
+  assert.match(data.text, /^Offer letter\nDear Sam,/);
+  assert.match(data.text, /Salary\t\$120,000/);
+});
+
+test('explains documents it cannot read', async () => {
+  for (const [name, type, message] of [
+    ['scanned.pdf', PDF, /no selectable text/],
+    ['locked.pdf', PDF, /password-protected/],
+    ['old.doc', 'application/octet-stream', /old Word file/],
+  ]) {
+    const res = await extract(name, type);
+    assert.equal(res.status, 422, name);
+    assert.match((await res.json()).error, message, name);
+  }
+});
+
+test('document upload only accepts PDF and Word types, within the size limit', async () => {
+  // A plain form post (text/plain) is refused, so other websites can't send files here.
+  let res = await fetch(`${base}/api/extract`, { method: 'POST', headers: { 'content-type': 'text/plain' }, body: 'x' });
+  assert.equal(res.status, 415);
+  res = await fetch(`${base}/api/extract`, {
+    method: 'POST',
+    headers: { 'content-type': PDF, 'x-file-name': 'huge.pdf' },
+    body: Buffer.alloc(20_000_001),
+  });
+  assert.equal(res.status, 413);
+  assert.match((await res.json()).error, /huge\.pdf is larger than 20 MB/);
 });

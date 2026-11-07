@@ -10,7 +10,10 @@
     "test": "node --test"
   },
   "engines": {
-    "node": ">=20.12"
+    "node": ">=22.13"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "pdfjs-dist": "6.4.299"
+  }
 }

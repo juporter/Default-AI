@@ -41,14 +41,43 @@ export function createCard(provider, model, { live = true } = {}) {
   const elapsed = () => (performance.now() - started) / 1000;
   const timer = live ? setInterval(() => (badge.textContent = `${elapsed().toFixed(1)}s`), 100) : null;
 
+  // Streaming: re-render the Markdown at most once per frame.
+  let streamed = '';
+  let frame = 0;
+  let streamBox = null;
+  const renderStream = () => {
+    frame = 0;
+    if (!streamBox) {
+      streamBox = h('div', { class: 'markdown streaming' });
+      body.replaceChildren(streamBox);
+    }
+    streamBox.innerHTML = renderMarkdown(streamed);
+  };
+
   return {
     el,
     /** Seconds since the card was created (for live cards). */
     elapsed,
 
+    /** The answer so far, while it streams in. */
+    update(text) {
+      streamed = text;
+      el.dataset.state = 'streaming';
+      if (!frame) frame = requestAnimationFrame(renderStream);
+    },
+
+    /** The model is reasoning before it starts to answer. */
+    thinking() {
+      if (streamed) return;
+      body.replaceChildren(
+        h('div', { class: 'thinking', role: 'status' }, h('div', { class: 'spinner', 'aria-hidden': 'true' }), h('span', { text: 'Thinking…' })),
+      );
+    },
+
     /** Show an answer: {text, model, usage, stopReason, sources, seconds?} */
     succeed(data) {
       clearInterval(timer);
+      cancelAnimationFrame(frame);
       el.dataset.state = 'done';
       const seconds = typeof data.seconds === 'number' ? data.seconds : live ? elapsed() : null;
       badge.textContent = seconds == null ? '' : `${seconds.toFixed(1)}s`;
@@ -103,7 +132,7 @@ export function createCard(provider, model, { live = true } = {}) {
       footer.replaceChildren(
         ...[
           h('span', { class: 'usage', text: usage.length ? `${usage.join(' · ')} tokens` : '' }),
-          data.costText && h('span', { class: 'cost', text: data.costText }),
+          data.costText && h('span', { class: 'cost', text: data.costText, title: data.costTitle || '' }),
           TRUNCATED.has(data.stopReason) && h('span', { class: 'warn', text: 'Cut off (token limit)' }),
           h('span', { class: 'spacer' }),
           toggle,
@@ -113,11 +142,15 @@ export function createCard(provider, model, { live = true } = {}) {
       footer.hidden = false;
     },
 
-    fail(message) {
+    /** Show an error, below any text that arrived before it. */
+    fail(message, partialText = streamed) {
       clearInterval(timer);
+      cancelAnimationFrame(frame);
       el.dataset.state = 'error';
-      badge.textContent = 'Error';
-      body.replaceChildren(h('p', { class: 'error', text: message }));
+      badge.textContent = message === 'Cancelled' ? 'Cancelled' : 'Error';
+      const partial = h('div', { class: 'markdown' });
+      if (partialText) partial.innerHTML = renderMarkdown(partialText);
+      body.replaceChildren(...[partialText && partial, h('p', { class: 'error', text: message })].filter(Boolean));
     },
   };
 }

@@ -19,13 +19,16 @@ You only need keys for the providers you want to use. Providers without a key ar
 
 ## Quick start
 
-Requires Node.js 20.12 or newer. There are no npm dependencies to install.
+Requires Node.js 22.13 or newer.
 
 ```sh
 git clone https://github.com/juporter/Default-AI.git
 cd Default-AI
+npm install     # one dependency: pdf.js, for reading PDF attachments
 npm start
 ```
+
+Everything except PDF attachments also works without `npm install`.
 
 Open http://127.0.0.1:3000. Add your API keys in **Settings → Import settings** (or copy `.env.example` to `.env` and fill it in), tick the models you want, type a prompt and press **Send** (or <kbd>Ctrl</kbd>+<kbd>Enter</kbd>).
 
@@ -35,16 +38,19 @@ Open http://127.0.0.1:3000. Add your API keys in **Settings → Import settings*
 
 - **Pick any mix of eight providers.** Your selection is remembered in the browser.
 - **Choose the model per provider.** Each dropdown is loaded live from that provider's model list, so new models show up without changing the code. If a list can't be loaded, suggested models are shown instead. Choose **Other model ID…** to type any ID.
-- **Attach files.** Add text files (code, Markdown, CSV, JSON, logs and so on) with **Attach files** or by dropping them on the prompt. Their contents are sent to every selected model with your prompt. Each file can be up to 1 MB, and 2 MB in total. PDFs, Word files and images aren't supported yet.
+- **Attach files.** Add text files (code, Markdown, CSV, JSON, logs and so on), **PDFs** and **Word (.docx)** files with **Attach files** or by dropping them on the prompt. Their text is sent to every selected model with your prompt. PDFs and Word files can be up to 20 MB; the text from all attachments together can be up to 2 MB. Scanned PDFs (pictures of pages, with no text layer), password-protected PDFs, old `.doc` files and images aren't supported.
 - **Optional system prompt**, sent to every selected model.
-- **Answers appear as they arrive.** Each card shows the elapsed time and token counts, and warns when an answer was cut off.
+- **Answers stream in word by word.** Each card shows the elapsed time, token counts and cost, and warns when an answer was cut off. Reasoning models show **Thinking…** until they start to answer. **Cancel** stops every model and keeps the text that arrived.
+- **Ask follow-up questions.** Under each set of answers, **Ask all models a follow-up** sends your next question to the same models. Each one sees its own earlier answers (and any attached files), so you can keep comparing as the conversation goes on.
+- **See what each answer cost.** Each card shows its cost, worked out from the token counts the provider reports and the list prices in `pricing.json`, and each conversation shows its total. A cost is marked as estimated when the provider didn't report token counts, and then the tokens are estimated from the length of the text. Models with no price listed show no cost. With [billing](#billing-charge-users-for-tokens) on, cards show what the user was charged instead.
 - **Perplexity searches the web.** Its answers come with a numbered list of sources.
 - **Formatted or raw output.** Markdown (code blocks, tables and lists) is rendered safely. Toggle **Raw** to see the original text, or use **Copy**.
 
 ### History
 
-- **Every prompt is saved**, with each model's answer and any attached files. History is stored in your browser, so it stays after you close the page.
-- **Search** prompts and answers, and filter by where they came from.
+- **Every prompt is saved**, with each model's answers, any follow-up questions and attached files. History is stored in your browser, so it stays after you close the page.
+- **Search** prompts, follow-ups and answers, and filter by where they came from.
+- **Continue conversation** reopens a saved conversation in Compare so you can ask more follow-ups.
 - **Use this prompt** puts an old prompt (and its files) back in the composer so you can send it to other models.
 - **Import chats from other apps:**
 
@@ -55,7 +61,7 @@ Open http://127.0.0.1:3000. Add your API keys in **Settings → Import settings*
   | Gemini | [Google Takeout](https://takeout.google.com/) → My Activity → Gemini Apps, with the format set to **JSON**. Upload the .zip, or `MyActivity.json`. |
   | Anything else | A JSON list of chats: `[{"title": "…", "messages": [{"role": "user", "content": "…"}, …]}]` |
 
-- **Export history** saves everything (your prompts and imported chats) to one JSON file. Import that file to restore it later or on another computer.
+- **Export history** saves everything (your conversations and imported chats) to one JSON file. Import that file to restore it later or on another computer. Files exported by older versions still import.
 - **Delete shown** removes whatever matches the current search and source filter.
 
 ### Settings
@@ -109,6 +115,8 @@ Accounts, balances and usage are kept in `data/billing.json` (passwords are hash
 
 A user who sends to several models at once can go slightly below zero, because every answer in that batch is charged after it arrives. The next prompt is then refused until they top up.
 
+Streamed answers are charged when they finish. If the user cancels, or the stream breaks off, the text that had arrived is charged, with its tokens estimated, because the provider bills for it too. Follow-up questions are charged like any prompt; each one includes the earlier conversation, so a long conversation costs more per question. Gemini's "thinking" tokens are counted as output tokens, as Google bills them.
+
 ## How it works
 
 ```
@@ -120,6 +128,9 @@ browser ──► server.js ──► OpenAI / Anthropic / Meta / Google / xAI /
 - `providers.js` describes each provider and converts between the app's format and each API. OpenAI, Meta, Grok, DeepSeek and Kimi use the OpenAI Chat Completions format. Claude uses the Anthropic Messages API. Gemini uses `generateContent`. Perplexity uses its Agent API with web search turned on.
 - `settings.js` reads, checks and saves imported settings files, and holds the ad settings.
 - `billing.js` holds accounts, pricing, charges and the Stripe calls (plain `fetch`, no Stripe SDK).
+- `extract.js` takes the text out of PDF and Word attachments: PDFs with Mozilla's pdf.js (`pdfjs-dist`, with font code evaluation turned off), Word files with the app's own .zip reader (`public/zip.js`).
+- Answers stream from each provider as server-sent events, and the server passes them to the browser as newline-delimited JSON (`POST /api/chat` with `"stream": true`). Follow-up questions send the whole conversation in each API's own format.
+- `public/runs.js` holds a conversation (the first prompt, its follow-ups and every model's answers) and draws it in Compare and History.
 - `public/` holds the UI: plain HTML, CSS and JavaScript with no build step. `public/importers.js` reads chat exports (including .zip files) in the browser, and `public/store.js` keeps History in the browser's IndexedDB.
 
 ## Configuration
@@ -164,4 +175,4 @@ Once the key is set, the model dropdown lists that host's models.
 npm test
 ```
 
-The tests check the request and response conversion for every provider, the chat-export importers (including real .zip files), settings import, the Markdown renderer's escaping, billing (pricing maths, Stripe signatures, sign-up → top-up → charge, password reset, and admin credits and refunds, through the server against a fake Stripe and email service), and the whole server. The server tests run against a fake provider, so no API keys are needed.
+The tests check the request and response conversion for every provider (including each one's streaming format and follow-up conversations), the chat-export importers (including real .zip files), text extraction from real PDF and Word files in `test/fixtures/`, settings import, the Markdown renderer's escaping, cost estimates, billing (pricing maths, Stripe signatures, sign-up → top-up → charge, charges for streamed and cut-off answers, password reset, and admin credits and refunds, through the server against a fake Stripe and email service), and the whole server. The server tests run against fake providers, so no API keys are needed.

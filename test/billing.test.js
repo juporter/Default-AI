@@ -152,6 +152,20 @@ function fakeUpstream(req, res) {
     if (m) return stripeSessions.has(m[1]) ? send(200, stripeSessions.get(m[1])) : send(404, { error: { message: 'No such session' } });
     if (req.url === '/openai/chat/completions') {
       const json = JSON.parse(body);
+      if (json.stream) {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        const chunk = (value) => res.write(`data: ${JSON.stringify(value)}\n\n`);
+        if (json.model === 'broken-stream') {
+          chunk({ choices: [{ delta: { content: 'Partial answer ' } }] });
+          chunk({ error: { message: 'connection reset' } });
+          return res.end();
+        }
+        for (const piece of ['hel', 'lo']) chunk({ model: json.model, choices: [{ delta: { content: piece } }] });
+        chunk({ model: json.model, choices: [{ delta: {}, finish_reason: 'stop' }] });
+        if (json.stream_options?.include_usage) chunk({ model: json.model, choices: [], usage: { prompt_tokens: 1000, completion_tokens: 500 } });
+        res.write('data: [DONE]\n\n');
+        return res.end();
+      }
       if (json.model === 'no-usage') {
         return send(200, { choices: [{ message: { content: 'abcdefgh' }, finish_reason: 'stop' }] });
       }
@@ -168,7 +182,9 @@ function fakeUpstream(req, res) {
 before(async () => {
   writeFileSync(
     pricingFile,
-    JSON.stringify({ openai: { 'gpt-test': { input: 3, output: 15 }, 'no-usage': { input: 1000, output: 1000 } } }),
+    JSON.stringify({
+      openai: { 'gpt-test': { input: 3, output: 15 }, 'no-usage': { input: 1000, output: 1000 }, 'broken-stream': { input: 1000, output: 1000 } },
+    }),
   );
   upstream = http.createServer(fakeUpstream).listen(0, '127.0.0.1');
   await once(upstream, 'listening');
@@ -464,6 +480,42 @@ test('admin: refund a card payment through Stripe, never more than was paid', as
   const after = await (await fetch(`${base}/api/admin/user?id=${users[0].id}`, { headers: { cookie: adminCookie } })).json();
   assert.equal(after.payments.find((p) => p.id === payment.id).refundedCents, 1000);
   assert.equal(refunds.length, 2);
+});
+
+test('streamed answers are charged when they finish, and cut-off streams for the text so far', async () => {
+  // A separate account, so the balances checked above stay as they are.
+  let res = await post('/api/auth/signup', { email: 'streamer@example.com', password: 'a good password' });
+  const streamer = cookieOf(res);
+  res = await post('/api/billing/checkout', { cents: 500 }, streamer);
+  const session = [...stripeSessions.values()].at(-1);
+  session.payment_status = 'paid';
+  res = await post('/api/billing/confirm', { session: session.id }, streamer);
+  assert.equal((await res.json()).balance, 5_000_000);
+
+  const stream = async (model) => {
+    const r = await post('/api/chat', { provider: 'openai', model, prompt: 'Hi', stream: true }, streamer);
+    return (await r.text()).trim().split('\n').map((line) => JSON.parse(line));
+  };
+
+  let events = await stream('gpt-test');
+  const done = events.at(-1);
+  assert.equal(done.type, 'done');
+  assert.equal(done.text, 'hello');
+  // Same as a non-streamed answer: (1000 × $3 + 500 × $15) / 1M, +20% = 12,600 µ$.
+  assert.equal(done.cost, 12_600);
+  assert.equal(done.balance, 5_000_000 - 12_600);
+  assert.equal(done.estimatedCost, undefined, 'billing shows the charge, not an estimate');
+
+  // Cut off after "Partial answer " (15 characters ≈ 4 tokens) with "Hi" (1 token) in:
+  // (1 × $1000 + 4 × $1000) / 1M, +20% = 6,000 µ$, marked as estimated.
+  events = await stream('broken-stream');
+  const error = events.at(-1);
+  assert.equal(error.type, 'error');
+  assert.equal(error.cost, 6_000);
+  assert.equal(error.balance, 5_000_000 - 12_600 - 6_000);
+  const account = await (await fetch(`${base}/api/account`, { headers: { cookie: streamer } })).json();
+  assert.equal(account.usage[0].estimated, true);
+  assert.equal(account.balance, 5_000_000 - 12_600 - 6_000);
 });
 
 test('sign-in, sign-up and reset requests are rate-limited', async () => {

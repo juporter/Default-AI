@@ -2,15 +2,14 @@
 // apps. Search, re-use a prompt, import, export and delete.
 
 import { h, $, fill, formatDate, formatBytes, downloadFile, confirmButton } from './dom.js';
-import { createCard } from './cards.js';
+import { createRunView, normalizeRun } from './runs.js';
 import { renderMarkdown } from './markdown.js';
 import * as store from './store.js';
 import { readImportFile, buildAppExport, SOURCES } from './importers.js';
-import { formatMoney } from './account.js';
 
 const MAX_LISTED = 300;
 
-let deps; // { usePrompt, providerById }
+let deps; // { usePrompt, continueRun, providerById }
 let entries = [];
 let stale = true;
 let selectedId = null;
@@ -59,13 +58,15 @@ export async function showHistory() {
 async function load() {
   const [runs, conversations] = await Promise.all([store.getAll('runs'), store.getAll('conversations')]);
   entries = [
-    ...runs.map((run) => ({
+    ...runs.map(normalizeRun).map((run) => ({
       type: 'run',
       id: run.id,
       source: 'app',
       title: firstLine(run.prompt),
       createdAt: run.createdAt,
-      meta: `${run.responses.length} model${run.responses.length === 1 ? '' : 's'}`,
+      meta:
+        `${run.models.length} model${run.models.length === 1 ? '' : 's'}` +
+        (run.turns.length > 1 ? ` · ${run.turns.length - 1} follow-up${run.turns.length === 2 ? '' : 's'}` : ''),
       item: run,
     })),
     ...conversations.map((c) => ({
@@ -85,7 +86,7 @@ function searchText(entry) {
   if (!entry.search) {
     const parts =
       entry.type === 'run'
-        ? [entry.item.prompt, entry.item.system, ...entry.item.responses.map((r) => r.text)]
+        ? [entry.item.system, ...entry.item.turns.flatMap((t) => [t.prompt, ...t.responses.map((r) => r.text)])]
         : [entry.title, ...entry.item.messages.map((m) => m.text)];
     entry.search = parts.join('\n').toLowerCase();
   }
@@ -166,6 +167,13 @@ function renderDetail(entry) {
 
   if (entry.type === 'run') {
     const run = entry.item;
+    const first = run.turns[0];
+    const view = createRunView(run, {
+      providerById: deps.providerById,
+      label: formatDate(run.createdAt),
+      showPrompt: false,
+      onContinue: () => deps.continueRun(run),
+    });
     fill(
       els.detail,
       h(
@@ -177,29 +185,20 @@ function renderDetail(entry) {
           { class: 'detail-actions' },
           h('button', {
             type: 'button',
-            class: 'primary small',
+            class: 'ghost small',
             text: 'Use this prompt',
-            onclick: () => deps.usePrompt({ prompt: run.prompt, system: run.system, attachments: run.attachments }),
+            title: 'Put the first prompt and its files back in the composer',
+            onclick: () => deps.usePrompt({ prompt: first.prompt, system: run.system, attachments: first.attachments }),
           }),
           remove,
         ),
       ),
-      h('div', { class: 'prompt-block', text: run.prompt }),
+      h('div', { class: 'prompt-block', text: first.prompt }),
       run.system ? h('p', { class: 'detail-system' }, h('strong', { text: 'System prompt: ' }), run.system) : null,
-      run.attachments.length
-        ? h('p', { class: 'run-files', text: `Files: ${run.attachments.map((a) => `${a.name} (${formatBytes(a.size)})`).join(', ')}` })
+      first.attachments?.length
+        ? h('p', { class: 'run-files', text: `Files: ${first.attachments.map((a) => `${a.name} (${formatBytes(a.size)})`).join(', ')}` })
         : null,
-      h(
-        'div',
-        { class: 'cards' },
-        run.responses.map((r) => {
-          const provider = deps.providerById(r.provider) || { id: r.provider, name: r.providerName || r.provider };
-          const card = createCard(provider, r.model, { live: false });
-          if (r.error) card.fail(r.error);
-          else card.succeed({ ...r, costText: typeof r.cost === 'number' ? formatMoney(r.cost) : '' });
-          return card.el;
-        }),
-      ),
+      view.el,
     );
     return;
   }
