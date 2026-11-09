@@ -224,8 +224,12 @@ test("this app's export round-trips and is sanitized", () => {
   const back = parseExport(JSON.parse(JSON.stringify(exported)));
   assert.equal(back.kind, 'app');
   assert.equal(back.runs.length, 1);
-  assert.deepEqual(back.runs[0].responses[0].sources, [{ title: 'Ok', url: 'https://ok.example' }]);
-  assert.equal(back.runs[0].attachments[0].text, 'abc');
+  // A version 1 run (one prompt) comes back as a run with one turn.
+  const [turn] = back.runs[0].turns;
+  assert.deepEqual(turn.responses[0].sources, [{ title: 'Ok', url: 'https://ok.example' }]);
+  assert.equal(turn.attachments[0].text, 'abc');
+  assert.equal(back.runs[0].prompt, 'Hello');
+  assert.deepEqual(back.runs[0].models, [{ provider: 'openai', providerName: 'OpenAI', model: 'gpt-x' }]);
   assert.equal(back.conversations[0].id, 'claude:k1');
   assert.equal(back.conversations[0].source, 'claude');
 });
@@ -268,4 +272,37 @@ test('clear errors for files it cannot read', async () => {
 test('htmlToText decodes entities and keeps structure', () => {
   assert.equal(htmlToText('<p>a &lt;b&gt; &#169; &#x41;</p><p>next<br>line</p>'), 'a <b> © A\n\nnext\nline');
   assert.equal(htmlToText('<script>alert(1)</script>ok'), 'ok');
+});
+
+test('conversations with follow-ups, costs and PDF page counts survive export and import', () => {
+  const run = {
+    id: 'r2',
+    createdAt: '2026-11-07T10:00:00.000Z',
+    system: 'Be brief',
+    models: [{ provider: 'anthropic', providerName: 'Claude', model: 'claude-x' }],
+    turns: [
+      {
+        prompt: 'Summarize',
+        attachments: [{ name: 'report.pdf', size: 120, text: 'Revenue grew', pages: 2 }],
+        createdAt: '2026-11-07T10:00:00.000Z',
+        responses: [{ provider: 'anthropic', providerName: 'Claude', model: 'claude-x', text: 'It grew.', estimatedCost: 350 }],
+      },
+      {
+        prompt: 'By how much?',
+        attachments: [],
+        createdAt: '2026-11-07T10:01:00.000Z',
+        responses: [{ provider: 'anthropic', providerName: 'Claude', model: 'claude-x', text: '12%.', cost: 1200, costEstimated: true }],
+      },
+    ],
+    prompt: 'Summarize',
+  };
+  const back = parseExport(JSON.parse(JSON.stringify(buildAppExport([run], []))));
+  const [saved] = back.runs;
+  assert.equal(saved.turns.length, 2);
+  assert.equal(saved.turns[0].attachments[0].pages, 2);
+  assert.equal(saved.turns[0].responses[0].estimatedCost, 350);
+  assert.equal(saved.turns[1].responses[0].cost, 1200);
+  assert.equal(saved.turns[1].responses[0].costEstimated, true);
+  assert.equal(saved.turns[1].prompt, 'By how much?');
+  assert.equal(saved.system, 'Be brief');
 });

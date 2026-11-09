@@ -1328,3 +1328,126 @@ button.link-button {
   flex-wrap: wrap;
   max-width: 100%;
 }
+
+/* Conversations: follow-up questions ------------------------------------- */
+
+.turns {
+  display: grid;
+  gap: 16px;
+}
+
+.turn {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.turn-prompt {
+  margin: 0;
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.turn-label {
+  flex: none;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--primary);
+}
+
+.follow-up {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+.follow-up-input {
+  min-height: 2.6em;
+}
+
+.follow-up-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.follow-up-actions .hint {
+  flex: 1 1 200px;
+}
+
+.run-header .spacer {
+  flex: 1;
+}
+
+.run-cost {
+  font-size: 0.82rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+/* Streaming --------------------------------------------------------------- */
+
+.thinking {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.thinking .spinner {
+  margin: 4px 0;
+  width: 18px;
+  height: 18px;
+}
+
+/* A blinking cursor after the text while it streams in. */
+.markdown.streaming > :last-child::after {
+  content: "▍";
+  margin-left: 1px;
+  color: var(--accent);
+  animation: caret 1s steps(1) infinite;
+}
+
+@keyframes caret {
+  50% {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .markdown.streaming > :last-child::after {
+    animation: none;
+  }
+}
+
+.card[data-state="streaming"] .badge {
+  color: var(--accent);
+}
+
+.card-footer .cost {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Attachments being read (PDF, Word) */
+
+.attachment.pending {
+  opacity: 0.7;
+}
+
+.attachment.pending .attachment-size {
+  font-style: italic;
+}

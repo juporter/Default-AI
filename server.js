@@ -6,7 +6,9 @@
 //
 //   GET  /api/providers              which providers exist / are configured
 //   GET  /api/models?provider=id     live model list from the provider
-//   POST /api/chat                   {provider, model, prompt, system} -> answer
+//   POST /api/chat                   {provider, model, messages | prompt, system, stream} -> answer
+//                                    (with stream: true, newline-delimited JSON events)
+//   POST /api/extract                a PDF or Word (.docx) file -> {text, pages}
 //   GET  /api/config                 page settings (ad slots)
 //   GET  /api/settings               current settings, secrets masked   (this computer only)
 //   POST /api/settings/preview       {text} -> what a settings file would change (this computer only)
@@ -43,8 +45,12 @@ import {
   buildModelsRequest,
   parseModelsResponse,
   extractErrorMessage,
+  normalizeMessages,
+  createSseReader,
+  createStreamParser,
 } from './providers.js';
 import { allowedVariables, parseSettingsText, maskValue, mergeEnvText, adsConfig } from './settings.js';
+import { extractDocument, ExtractError, MAX_DOCUMENT_BYTES, DOCUMENT_TYPES } from './extract.js';
 import {
   billingConfig,
   parsePricing,
@@ -74,6 +80,8 @@ const AUTH_WINDOW_MS = 15 * 60 * 1000;
 const AUTH_MAX_ATTEMPTS = 10;
 // Large enough for a prompt with attached files (the browser caps attachments at 2 MB).
 const MAX_BODY_BYTES = 8_000_000;
+// Follow-up questions per conversation (each is a question and an answer).
+const MAX_TURNS = 50;
 const MODEL_CACHE_MS = 10 * 60 * 1000;
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
 
@@ -140,12 +148,11 @@ export function createApp(
     billing = billingConfig(env);
     pricing = new Map();
     pricingError = '';
-    if (billing.enabled) {
-      try {
-        pricing = parsePricing(readFileSync(pricingFile, 'utf8'));
-      } catch (err) {
-        pricingError = err.code === 'ENOENT' ? `${path.basename(pricingFile)} not found` : err.message;
-      }
+    // Prices are loaded even with billing off, to show cost estimates.
+    try {
+      pricing = parsePricing(readFileSync(pricingFile, 'utf8'));
+    } catch (err) {
+      if (billing.enabled) pricingError = err.code === 'ENOENT' ? `${path.basename(pricingFile)} not found` : err.message;
     }
   };
   reload();
@@ -178,59 +185,186 @@ export function createApp(
     const input = await readJson(req);
     const user = billing.enabled ? await requireUser(req) : null;
     const p = requireProvider(input.provider);
-    const prompt = typeof input.prompt === 'string' ? input.prompt : '';
-    if (!prompt.trim()) throw new HttpError(400, 'Prompt is empty');
+    // A conversation (follow-up questions) or, for older clients, a single prompt.
+    const messages = normalizeMessages({ prompt: input.prompt, messages: input.messages });
+    if (!messages.length || messages.at(-1).role !== 'user' || !messages.at(-1).content.trim()) {
+      throw new HttpError(400, 'Prompt is empty');
+    }
+    if (messages.length > MAX_TURNS * 2) throw new HttpError(400, 'This conversation is too long. Start a new prompt.');
     const system = typeof input.system === 'string' ? input.system.trim() : '';
     const model = (typeof input.model === 'string' && input.model.trim()) || p.defaultModel;
     if (model.length > 200) throw new HttpError(400, 'Model ID is too long');
 
-    let price = null;
+    // The list price is used for billing, and for a cost estimate when billing is off.
+    const price = priceFor(pricing, p.id, model);
     if (user) {
-      price = priceFor(pricing, p.id, model);
       if (!price) throw new HttpError(400, `${model} has no price set, so it can't be used yet. Choose another model.`);
       if (user.balance <= 0) throw new HttpError(402, 'Your balance is used up. Add credit under Account to keep going.');
     }
+    const promptText = (system ? `${system}\n` : '') + messages.map((m) => m.content).join('\n');
+    const bill = (result, partial = false) => settleCost({ user, price, provider: p.id, model, promptText, result, partial });
 
     const started = performance.now();
-    const { url, init } = buildChatRequest(p, { model, prompt, system, maxTokens: maxTokens() });
-    let json;
+    const stream = input.stream === true;
+    const { url, init } = buildChatRequest(p, { model, messages, system, maxTokens: maxTokens(), stream });
+    const signal = requestSignal(res, timeoutMs());
+    const timedOut = (err) => err?.name === 'TimeoutError';
+    const TIMEOUT_MESSAGE = 'The provider did not answer in time (see REQUEST_TIMEOUT_MS)';
+
+    if (!stream) {
+      let json;
+      try {
+        json = await upstream(url, init, signal);
+      } catch (err) {
+        if (timedOut(err)) throw new HttpError(504, TIMEOUT_MESSAGE);
+        throw err;
+      }
+      let result;
+      try {
+        result = parseChatResponse(p, json);
+      } catch (err) {
+        throw new HttpError(502, err.message);
+      }
+      sendJson(res, 200, {
+        ...result,
+        model: result.model || model,
+        latencyMs: Math.round(performance.now() - started),
+        ...(await bill(result)),
+      });
+      return;
+    }
+
+    // --- Streaming: newline-delimited JSON events to the browser ------------
+    //   {type: 'thinking'}                     the model is reasoning before it answers
+    //   {type: 'delta', text}                  the next piece of the answer
+    //   {type: 'done', text, model, usage, …}  the whole answer, its cost and timing
+    //   {type: 'error', error}                 the stream broke off
+    let upstreamRes;
     try {
-      json = await upstream(url, init, requestSignal(res, timeoutMs()));
+      upstreamRes = await fetchImpl(url, { ...init, signal });
     } catch (err) {
-      if (err.name === 'TimeoutError') throw new HttpError(504, 'The provider did not answer in time (see REQUEST_TIMEOUT_MS)');
+      if (timedOut(err)) throw new HttpError(504, TIMEOUT_MESSAGE);
       throw err;
     }
+    if (!upstreamRes.ok) {
+      throw new HttpError(502, extractErrorMessage(await upstreamRes.text().catch(() => ''), upstreamRes.status));
+    }
+
+    res.writeHead(200, {
+      'content-type': 'application/x-ndjson; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-accel-buffering': 'no', // ask reverse proxies (nginx) not to buffer the stream
+      ...BASE_HEADERS,
+    });
+    const send = (event) => {
+      if (!res.destroyed && !res.writableEnded) res.write(`${JSON.stringify(event)}\n`);
+    };
+    const parser = createStreamParser(p);
+    let thinkingSent = false;
+    const forward = (events) => {
+      for (const event of events) {
+        for (const out of parser.feed(event)) {
+          if (out.type === 'delta') send(out);
+          else if (!thinkingSent) {
+            thinkingSent = true;
+            send(out);
+          }
+        }
+      }
+    };
+
     let result;
     try {
-      result = parseChatResponse(p, json);
+      if ((upstreamRes.headers.get('content-type') || '').includes('application/json')) {
+        // The provider answered all at once instead of streaming.
+        result = parseChatResponse(p, JSON.parse(await upstreamRes.text()));
+        if (result.text) send({ type: 'delta', text: result.text });
+      } else {
+        const reader = createSseReader();
+        const decoder = new TextDecoder();
+        for await (const chunk of upstreamRes.body) forward(reader.push(decoder.decode(chunk, { stream: true })));
+        forward(reader.push(decoder.decode()));
+        forward(reader.end());
+        result = parser.finish();
+      }
     } catch (err) {
-      throw new HttpError(502, err.message);
+      // Charge for whatever was generated before the stream broke off (or the
+      // browser cancelled), since the provider bills for it too.
+      const partial = parser.finish();
+      const cost = partial.text ? await bill(partial, true).catch(() => ({})) : {};
+      send({ type: 'error', error: timedOut(err) ? TIMEOUT_MESSAGE : err.message || 'The stream broke off', ...cost });
+      res.end();
+      return;
     }
-    let charge = {};
-    if (user) {
-      // Bill the model we asked for: that's the one with a price, even if the
-      // provider reports a dated variant of it.
-      const reported = Number.isFinite(result.usage?.input) && Number.isFinite(result.usage?.output);
-      const tokens = reported
-        ? { input: result.usage.input, output: result.usage.output }
-        : { input: estimateTokens(system + prompt), output: estimateTokens(result.text) };
-      const cost = costMicros(price, tokens, billing.markupPercent);
-      const balance = await store.charge(user.id, {
-        provider: p.id,
-        model,
-        input: tokens.input,
-        output: tokens.output,
-        estimated: !reported,
-        cost,
-      });
-      charge = { cost, balance };
-    }
-    sendJson(res, 200, {
+    send({
+      type: 'done',
       ...result,
       model: result.model || model,
       latencyMs: Math.round(performance.now() - started),
-      ...charge,
+      ...(await bill(result)),
     });
+    res.end();
+  }
+
+  /**
+   * Work out an answer's cost from the provider's token counts (or an
+   * estimate from its length). With billing on, charge the user; otherwise
+   * return an estimate at list price, if the model has one.
+   */
+  async function settleCost({ user, price, provider, model, promptText, result, partial }) {
+    if (!price) return {};
+    const reported = !partial && Number.isFinite(result.usage?.input) && Number.isFinite(result.usage?.output);
+    const tokens = reported
+      ? { input: result.usage.input, output: result.usage.output }
+      : {
+          input: Number.isFinite(result.usage?.input) ? result.usage.input : estimateTokens(promptText),
+          output: Math.max(result.usage?.output || 0, estimateTokens(result.text)),
+        };
+    const estimated = reported ? {} : { costEstimated: true };
+    if (!user) return { estimatedCost: costMicros(price, tokens, 0), ...estimated };
+    // Bill the model we asked for: that's the one with a price, even if the
+    // provider reports a dated variant of it.
+    const cost = costMicros(price, tokens, billing.markupPercent);
+    const balance = await store.charge(user.id, {
+      provider,
+      model,
+      input: tokens.input,
+      output: tokens.output,
+      estimated: !reported,
+      cost,
+    });
+    return { cost, balance, ...estimated };
+  }
+
+  // --- Attachments: text from PDF and Word files ------------------------------
+
+  async function handleExtract(req, res) {
+    // Only these binary types are accepted. They can't be sent by a plain
+    // cross-site form, so other websites can't post files here either.
+    const type = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    if (![DOCUMENT_TYPES.pdf, DOCUMENT_TYPES.docx, 'application/octet-stream'].includes(type)) {
+      throw new HttpError(415, 'Send a PDF or Word (.docx) file.');
+    }
+    if (billing.enabled) await requireUser(req);
+    let name = '';
+    try {
+      name = decodeURIComponent(String(req.headers['x-file-name'] || '')).slice(0, 200);
+    } catch {
+      // keep the default
+    }
+    const body = await readRaw(req, MAX_DOCUMENT_BYTES).catch((err) => {
+      if (err instanceof HttpError && err.status === 413) {
+        throw new HttpError(413, `${name || 'The file'} is larger than ${MAX_DOCUMENT_BYTES / 1_000_000} MB.`);
+      }
+      throw err;
+    });
+    try {
+      const { text, pages } = await extractDocument(new Uint8Array(body), name);
+      sendJson(res, 200, { text, ...(pages ? { pages } : {}) });
+    } catch (err) {
+      if (err instanceof ExtractError) throw new HttpError(422, err.message);
+      throw err;
+    }
   }
 
   // --- Billing: accounts, credit and Stripe ----------------------------------
@@ -588,6 +722,8 @@ export function createApp(
           return await handleModels(res, url.searchParams.get('provider'));
         case 'POST /api/chat':
           return await handleChat(req, res);
+        case 'POST /api/extract':
+          return await handleExtract(req, res);
         case 'GET /api/config':
           return sendJson(res, 200, { ads: adsConfig(env), billing: publicBilling() });
         case 'POST /api/auth/signup':

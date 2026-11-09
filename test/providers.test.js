@@ -9,6 +9,9 @@ import {
   buildModelsRequest,
   parseModelsResponse,
   extractErrorMessage,
+  normalizeMessages,
+  createSseReader,
+  createStreamParser,
 } from '../providers.js';
 
 const byId = (env = {}) => Object.fromEntries(resolveProviders(env).map((p) => [p.id, p]));
@@ -263,4 +266,198 @@ test('extractErrorMessage handles each provider’s error shape', () => {
   assert.equal(extractErrorMessage('{"detail":"Nope"}', 403), 'HTTP 403: Nope');
   assert.equal(extractErrorMessage('<html>gateway</html>', 502), 'HTTP 502: <html>gateway</html>');
   assert.equal(extractErrorMessage('', 500), 'HTTP 500');
+});
+
+// ---------------------------------------------------------------------------
+// Conversations (follow-up questions)
+// ---------------------------------------------------------------------------
+
+const history = [
+  { role: 'user', content: 'Q1' },
+  { role: 'assistant', content: 'A1' },
+  { role: 'user', content: 'Q2' },
+];
+
+test('normalizeMessages keeps user/assistant turns and accepts a plain prompt', () => {
+  assert.deepEqual(normalizeMessages({ prompt: 'Hi' }), [{ role: 'user', content: 'Hi' }]);
+  assert.deepEqual(
+    normalizeMessages({ messages: [...history, { role: 'system', content: 'x' }, { role: 'user', content: '' }, null] }),
+    history,
+  );
+});
+
+test('a conversation is sent in each API’s own shape', () => {
+  const env = { OPENAI_API_KEY: 'k', ANTHROPIC_API_KEY: 'k', GEMINI_API_KEY: 'k', PERPLEXITY_API_KEY: 'k' };
+  const p = byId(env);
+  const body = (id) => JSON.parse(buildChatRequest(p[id], { model: 'm', messages: history, system: 'S', maxTokens: 50 }).init.body);
+
+  assert.deepEqual(body('openai').messages, [{ role: 'system', content: 'S' }, ...history]);
+  assert.deepEqual(body('anthropic').messages, history);
+  assert.deepEqual(body('gemini').contents, [
+    { role: 'user', parts: [{ text: 'Q1' }] },
+    { role: 'model', parts: [{ text: 'A1' }] },
+    { role: 'user', parts: [{ text: 'Q2' }] },
+  ]);
+  assert.deepEqual(body('perplexity').input, [
+    { type: 'message', role: 'user', content: 'Q1' },
+    { type: 'message', role: 'assistant', content: 'A1' },
+    { type: 'message', role: 'user', content: 'Q2' },
+  ]);
+  assert.equal(body('perplexity').instructions, 'S');
+});
+
+// ---------------------------------------------------------------------------
+// Streaming
+// ---------------------------------------------------------------------------
+
+test('stream requests use each API’s streaming switch', () => {
+  const env = { OPENAI_API_KEY: 'k', META_API_KEY: 'k', ANTHROPIC_API_KEY: 'k', GEMINI_API_KEY: 'k', PERPLEXITY_API_KEY: 'k', KIMI_API_KEY: 'k' };
+  const p = byId(env);
+  const req = (id) => buildChatRequest(p[id], { model: 'm', prompt: 'Hi', maxTokens: 50, stream: true });
+  const body = (id) => JSON.parse(req(id).init.body);
+
+  assert.equal(body('openai').stream, true);
+  assert.deepEqual(body('openai').stream_options, { include_usage: true });
+  assert.deepEqual(body('kimi').stream_options, { include_usage: true });
+  assert.equal(body('meta').stream, true);
+  assert.equal('stream_options' in body('meta'), false, 'Meta does not document stream_options');
+  assert.equal(body('anthropic').stream, true);
+  assert.equal(body('perplexity').stream, true);
+  assert.match(req('gemini').url, /:streamGenerateContent\?alt=sse$/);
+  // Not streaming: none of the switches.
+  const plain = JSON.parse(buildChatRequest(p.openai, { model: 'm', prompt: 'Hi' }).init.body);
+  assert.equal('stream' in plain || 'stream_options' in plain, false);
+});
+
+test('SSE reader handles events split anywhere, CRLF, comments and multi-line data', () => {
+  const reader = createSseReader();
+  const raw = ': keep-alive\r\nevent: a\r\ndata: one\r\n\r\ndata: two\ndata: lines\n\ndata: [DONE]\n\n';
+  const events = [];
+  for (const ch of raw) events.push(...reader.push(ch)); // worst case: one character at a time
+  events.push(...reader.end());
+  assert.deepEqual(events, [
+    { event: 'a', data: 'one' },
+    { event: '', data: 'two\nlines' },
+    { event: '', data: '[DONE]' },
+  ]);
+  // A final event without a trailing blank line is still delivered at the end.
+  const tail = createSseReader();
+  assert.deepEqual(tail.push('data: last'), []);
+  assert.deepEqual(tail.end(), [{ event: '', data: 'last' }]);
+});
+
+/** Run a fake SSE body through the reader and a provider's parser. */
+function streamThrough(p, raw) {
+  const reader = createSseReader();
+  const parser = createStreamParser(p);
+  const outputs = [];
+  // Feed in uneven chunks to mimic the network.
+  for (let i = 0; i < raw.length; i += 7) {
+    for (const ev of reader.push(raw.slice(i, i + 7))) outputs.push(...parser.feed(ev));
+  }
+  for (const ev of reader.end()) outputs.push(...parser.feed(ev));
+  return { outputs, result: parser.finish() };
+}
+
+const sse = (events) => events.map((e) => (e.event ? `event: ${e.event}\n` : '') + `data: ${typeof e.data === 'string' ? e.data : JSON.stringify(e.data)}\n\n`).join('');
+
+test('streams Chat Completions (OpenAI style) with a usage-only last chunk', () => {
+  const raw = sse([
+    { data: { model: 'gpt-x', choices: [{ delta: { role: 'assistant', content: '' } }] } },
+    { data: { model: 'gpt-x', choices: [{ delta: { reasoning_content: 'hmm' } }] } },
+    { data: { model: 'gpt-x', choices: [{ delta: { content: 'Hel' } }] } },
+    { data: { model: 'gpt-x', choices: [{ delta: { content: 'lo' }, finish_reason: 'stop' }] } },
+    { data: { model: 'gpt-x', choices: [], usage: { prompt_tokens: 9, completion_tokens: 2 } } },
+    { data: '[DONE]' },
+  ]);
+  const { outputs, result } = streamThrough(byId().openai, raw);
+  assert.deepEqual(outputs, [{ type: 'thinking' }, { type: 'delta', text: 'Hel' }, { type: 'delta', text: 'lo' }]);
+  assert.deepEqual(result, { text: 'Hello', model: 'gpt-x', usage: { input: 9, output: 2 }, stopReason: 'stop' });
+});
+
+test('streams Chat Completions where usage rides on the last content chunk (DeepSeek, Kimi)', () => {
+  const raw = sse([
+    { data: { choices: [{ delta: { content: 'Hi' } }] } },
+    { data: { choices: [{ delta: { content: '!' }, finish_reason: 'stop', usage: { prompt_tokens: 3, completion_tokens: 2 } }] } },
+    { data: '[DONE]' },
+  ]);
+  assert.deepEqual(streamThrough(byId().kimi, raw).result.usage, { input: 3, output: 2 });
+});
+
+test('streams Claude events', () => {
+  const raw = sse([
+    { event: 'message_start', data: { type: 'message_start', message: { model: 'claude-x', usage: { input_tokens: 25, output_tokens: 1 } } } },
+    { event: 'ping', data: { type: 'ping' } },
+    { event: 'content_block_delta', data: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: '...' } } },
+    { event: 'content_block_delta', data: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Hi ' } } },
+    { event: 'content_block_delta', data: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'there' } } },
+    { event: 'message_delta', data: { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 15 } } },
+    { event: 'message_stop', data: { type: 'message_stop' } },
+  ]);
+  const { outputs, result } = streamThrough(byId().anthropic, raw);
+  assert.equal(outputs[0].type, 'thinking');
+  assert.deepEqual(result, { text: 'Hi there', model: 'claude-x', usage: { input: 25, output: 15 }, stopReason: 'end_turn' });
+});
+
+test('a Claude error event fails the stream', () => {
+  const raw = sse([{ event: 'error', data: { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } } }]);
+  assert.throws(() => streamThrough(byId().anthropic, raw), /Overloaded/);
+});
+
+test('streams Gemini, skipping thought parts and counting thinking tokens as output', () => {
+  const raw = sse([
+    { data: { candidates: [{ content: { parts: [{ text: 'planning', thought: true }] } }] } },
+    { data: { candidates: [{ content: { parts: [{ text: 'Snow ' }] } }] } },
+    {
+      data: {
+        modelVersion: 'gemini-x-001',
+        candidates: [{ content: { parts: [{ text: 'falls' }] }, finishReason: 'STOP' }],
+        usageMetadata: { promptTokenCount: 4, candidatesTokenCount: 2, thoughtsTokenCount: 10 },
+      },
+    },
+  ]);
+  const { result } = streamThrough(byId().gemini, raw);
+  assert.deepEqual(result, { text: 'Snow falls', model: 'gemini-x-001', usage: { input: 4, output: 12 }, stopReason: 'STOP' });
+});
+
+test('streams Perplexity Agent API events with sources from the completed response', () => {
+  const raw = sse([
+    { data: { type: 'response.created', response: { status: 'in_progress' } } },
+    { data: { type: 'response.output_text.delta', delta: 'Grounded ' } },
+    { data: { type: 'response.output_text.delta', delta: 'answer' } },
+    {
+      data: {
+        type: 'response.completed',
+        response: {
+          model: 'perplexity/sonar',
+          status: 'completed',
+          output: [
+            { type: 'search_results', results: [{ title: 'Src', url: 'https://src.example' }] },
+            { type: 'message', content: [{ type: 'output_text', text: 'Grounded answer' }] },
+          ],
+          usage: { input_tokens: 11, output_tokens: 4 },
+        },
+      },
+    },
+  ]);
+  const { result } = streamThrough(byId().perplexity, raw);
+  assert.deepEqual(result, {
+    text: 'Grounded answer',
+    model: 'perplexity/sonar',
+    usage: { input: 11, output: 4 },
+    stopReason: undefined,
+    sources: [{ title: 'Src', url: 'https://src.example' }],
+  });
+  assert.throws(
+    () => streamThrough(byId().perplexity, sse([{ data: { type: 'response.failed', response: { error: { message: 'Quota exceeded' } } } }])),
+    /Quota exceeded/,
+  );
+});
+
+test('non-streamed Gemini answers also count thinking tokens as output', () => {
+  const out = parseChatResponse(byId().gemini, {
+    candidates: [{ content: { parts: [{ text: 'x' }] } }],
+    usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 2, thoughtsTokenCount: 30 },
+  });
+  assert.deepEqual(out.usage, { input: 1, output: 32 });
 });

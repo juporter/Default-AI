@@ -1,6 +1,6 @@
 import { h, $, formatBytes } from './dom.js';
-import { createCard } from './cards.js';
-import { buildPrompt, checkFile, looksBinary } from './prompt.js';
+import { checkFile, checkText, documentType, isDocument, looksBinary, textBytes } from './prompt.js';
+import { createRunView, normalizeRun, conversationFor, costText, costTitle } from './runs.js';
 import * as store from './store.js';
 import { setupAds } from './ads.js';
 import { initHistory, showHistory, markHistoryStale } from './history.js';
@@ -240,6 +240,7 @@ function modelPicker(p) {
       const res = await fetch(`/api/models?provider=${encodeURIComponent(p.id)}`);
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      if (!data.models.length) throw new Error('the provider listed no models');
       state.models[p.id] = data.models;
       if (custom.hidden) fillOptions(data.models);
       meta.textContent = `${data.models.length} model${data.models.length === 1 ? '' : 's'} available`;
@@ -284,15 +285,46 @@ function updateSendButton() {
 // Attachments
 // ---------------------------------------------------------------------------
 
+const attachedBytes = (except) => state.attachments.reduce((n, a) => (a === except ? n : n + (a.size || 0)), 0);
+
 async function addFiles(files) {
   const problems = [];
+  const showProblems = () => {
+    els.attachError.textContent = problems.join(' ');
+    els.attachError.hidden = !problems.length;
+  };
   for (const file of files) {
-    const used = state.attachments.reduce((n, a) => n + a.size, 0);
-    const problem = checkFile(file, used);
+    const problem = checkFile(file, attachedBytes());
     if (problem) {
       problems.push(problem);
       continue;
     }
+
+    if (isDocument(file)) {
+      // PDFs and Word files: the server pulls out their text.
+      const item = { name: file.name, size: 0, text: '', pending: true };
+      state.attachments.push(item);
+      renderAttachments();
+      try {
+        const res = await fetch('/api/extract', {
+          method: 'POST',
+          headers: { 'content-type': documentType(file), 'x-file-name': encodeURIComponent(file.name) },
+          body: file,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        const tooBig = checkText(file.name, data.text, attachedBytes(item));
+        if (tooBig) throw new Error(tooBig);
+        Object.assign(item, { pending: false, text: data.text, size: textBytes(data.text), ...(data.pages ? { pages: data.pages } : {}) });
+      } catch (err) {
+        state.attachments.splice(state.attachments.indexOf(item), 1);
+        problems.push(err.message.includes(file.name) ? err.message : `${file.name}: ${err.message}`);
+      }
+      renderAttachments();
+      showProblems();
+      continue;
+    }
+
     const text = await file.text();
     if (looksBinary(text)) {
       problems.push(`${file.name} doesn't look like a text file.`);
@@ -301,25 +333,28 @@ async function addFiles(files) {
     state.attachments.push({ name: file.name, size: file.size, text });
   }
   renderAttachments();
-  els.attachError.textContent = problems.join(' ');
-  els.attachError.hidden = !problems.length;
+  showProblems();
 }
 
 function renderAttachments() {
   els.attachments.replaceChildren(
-    ...state.attachments.map((file, index) =>
+    ...state.attachments.map((file) =>
       h(
         'li',
-        { class: 'attachment' },
+        { class: `attachment${file.pending ? ' pending' : ''}` },
         h('span', { class: 'attachment-name', text: file.name }),
-        h('span', { class: 'attachment-size', text: formatBytes(file.size) }),
+        h('span', {
+          class: 'attachment-size',
+          text: file.pending ? 'Reading…' : file.pages ? `${file.pages} page${file.pages === 1 ? '' : 's'}` : formatBytes(file.size),
+          title: file.pending ? '' : `${formatBytes(file.size)} of text`,
+        }),
         h('button', {
           type: 'button',
           class: 'attachment-remove',
           'aria-label': `Remove ${file.name}`,
           text: '×',
           onclick: () => {
-            state.attachments.splice(index, 1);
+            state.attachments.splice(state.attachments.indexOf(file), 1);
             renderAttachments();
             els.attachError.hidden = true;
           },
@@ -331,12 +366,14 @@ function renderAttachments() {
 }
 
 // ---------------------------------------------------------------------------
-// Running a prompt
+// Running a prompt, and follow-up questions
 // ---------------------------------------------------------------------------
 
 function newId() {
   return globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
+
+const providerById = (id) => state.providers.find((p) => p.id === id);
 
 async function sendPrompt(event) {
   event.preventDefault();
@@ -349,6 +386,11 @@ async function sendPrompt(event) {
     els.prompt.focus();
     return;
   }
+  if (state.attachments.some((a) => a.pending)) {
+    els.attachError.textContent = 'Wait until the attached files have been read.';
+    els.attachError.hidden = false;
+    return;
+  }
   const targets = selectedProviders();
   if (!targets.length) return;
 
@@ -356,82 +398,134 @@ async function sendPrompt(event) {
   state.prefs.system = system;
   savePrefs();
 
-  const attachments = state.attachments.map((a) => ({ ...a }));
-  const fullPrompt = buildPrompt(prompt, attachments);
-  const controller = new AbortController();
-  const run = createRun(prompt, attachments, targets, controller);
-  els.results.prepend(run.el);
+  const run = {
+    id: newId(),
+    createdAt: new Date().toISOString(),
+    system,
+    models: targets.map((p) => ({ provider: p.id, providerName: p.name, model: currentModel(p) })),
+    turns: [],
+    prompt,
+  };
+  const view = showRunInCompare(run);
+  await sendTurn(run, view, prompt, state.attachments.map(({ name, size, text, pages }) => ({ name, size, text, ...(pages ? { pages } : {}) })));
+}
+
+/** Put a run at the top of Compare, with a follow-up box. */
+function showRunInCompare(run) {
+  let view;
+  view = createRunView(run, {
+    providerById,
+    onFollowUp: (question) => sendTurn(run, view, question, []),
+  });
+  els.results.prepend(view.el);
   els.emptyResults.hidden = true;
   els.clearResults.hidden = false;
+  return view;
+}
 
-  const responses = await Promise.all(
-    targets.map((p, index) => askProvider(p, currentModel(p), fullPrompt, system, run.cards[index], controller.signal)),
+/** Ask every model in the run one question (the first prompt or a follow-up). */
+async function sendTurn(run, view, prompt, attachments) {
+  const turn = { prompt, attachments, createdAt: new Date().toISOString(), responses: [] };
+  run.turns.push(turn);
+  const index = run.turns.length - 1;
+  const cards = view.addTurn(turn, { live: true });
+  const controller = new AbortController();
+  view.setBusy(true, () => controller.abort());
+
+  turn.responses = await Promise.all(
+    run.models.map((m, i) =>
+      askProvider(m, conversationFor(run, m.provider, index), run.system, cards[i], controller.signal),
+    ),
   );
-  run.done();
+  view.setBusy(false);
+  view.refreshCost();
 
-  // Save to History.
-  const record = { id: newId(), createdAt: run.createdAt, prompt, system, attachments, responses };
   try {
-    await store.putMany('runs', [record]);
+    await store.putMany('runs', [run]);
     markHistoryStale();
   } catch (err) {
     showNotice(`This answer couldn't be saved to History: ${err.message}`);
   }
 }
 
-function createRun(prompt, attachments, targets, controller) {
-  const createdAt = new Date().toISOString();
-  const cancel = h('button', { type: 'button', class: 'ghost small', text: 'Cancel', onclick: () => controller.abort() });
-  const cards = targets.map((p) => createCard(p, currentModel(p)));
-  const el = h(
-    'section',
-    { class: 'run' },
-    h(
-      'header',
-      { class: 'run-header' },
-      h('p', { class: 'run-prompt', title: prompt, text: prompt.length > 220 ? `${prompt.slice(0, 220)}…` : prompt }),
-      h('span', { class: 'run-time', text: new Date(createdAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) }),
-      cancel,
-    ),
-    attachments.length
-      ? h('p', { class: 'run-files', text: `Files: ${attachments.map((a) => a.name).join(', ')}` })
-      : null,
-    h('div', { class: 'cards' }, cards.map((c) => c.el)),
-  );
-  return { el, cards, createdAt, done: () => cancel.remove() };
+/** Read newline-delimited JSON events from a streamed response. */
+async function readEvents(res, onEvent) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    for (const line of lines) if (line.trim()) onEvent(JSON.parse(line));
+    if (done) break;
+  }
+  if (buffer.trim()) onEvent(JSON.parse(buffer));
 }
 
-async function askProvider(p, model, prompt, system, card, signal) {
-  const base = { provider: p.id, providerName: p.name, model, usage: {}, stopReason: '', sources: [] };
+/** Stream one model's answer into its card. Resolves with the saved response. */
+async function askProvider(m, messages, system, card, signal) {
+  const base = { provider: m.provider, providerName: m.providerName, model: m.model, usage: {}, stopReason: '', sources: [] };
+  let text = '';
   try {
     const res = await fetch('/api/chat', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ provider: p.id, model, prompt, system }),
+      body: JSON.stringify({ provider: m.provider, model: m.model, messages, system, stream: true }),
       signal,
     });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-    const seconds = card.elapsed();
-    card.succeed({ ...data, seconds, costText: typeof data.cost === 'number' ? account.formatMoney(data.cost) : '' });
-    account.updateBalance(data.balance);
-    return {
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || `HTTP ${res.status}`);
+    }
+    let done = null;
+    let failure = null;
+    await readEvents(res, (event) => {
+      if (event.type === 'delta') {
+        text += event.text;
+        card.update(text);
+      } else if (event.type === 'thinking') {
+        card.thinking();
+      } else if (event.type === 'done') {
+        done = event;
+      } else if (event.type === 'error') {
+        failure = event;
+      }
+    });
+    if (failure) {
+      account.updateBalance(failure.balance);
+      const err = new Error(failure.error || 'The answer broke off');
+      err.cost = pickCost(failure);
+      throw err;
+    }
+    if (!done) throw new Error('The answer stopped before it finished.');
+
+    const response = {
       ...base,
-      model: data.model || model,
-      text: data.text || '',
+      model: done.model || m.model,
+      text: done.text ?? text,
       error: '',
-      seconds,
-      usage: data.usage || {},
-      stopReason: data.stopReason || '',
-      sources: data.sources || [],
-      ...(typeof data.cost === 'number' ? { cost: data.cost } : {}),
+      seconds: card.elapsed(),
+      usage: done.usage || {},
+      stopReason: done.stopReason || '',
+      sources: done.sources || [],
+      ...pickCost(done),
     };
+    card.succeed({ ...response, costText: costText(response), costTitle: costTitle(response) });
+    account.updateBalance(done.balance);
+    return response;
   } catch (err) {
     const message = err.name === 'AbortError' ? 'Cancelled' : err.message || 'Request failed';
-    const seconds = card.elapsed();
-    card.fail(message);
-    return { ...base, text: '', error: message, seconds };
+    card.fail(message, text);
+    return { ...base, text, error: message, seconds: card.elapsed(), ...(err.cost || {}) };
   }
+}
+
+function pickCost(event) {
+  const out = {};
+  for (const key of ['cost', 'estimatedCost', 'costEstimated']) if (event[key] !== undefined) out[key] = event[key];
+  return out;
 }
 
 /** Called from History: put an old prompt (and its files) back in the composer. */
@@ -439,11 +533,27 @@ function usePrompt({ prompt, system = '', attachments = [] }) {
   els.prompt.value = prompt;
   els.system.value = system;
   if (system) els.systemDetails.open = true;
-  state.attachments = attachments.map((a) => ({ name: a.name, size: a.size ?? a.text.length, text: a.text }));
+  state.attachments = attachments.map((a) => ({ name: a.name, size: a.size ?? textBytes(a.text), text: a.text, ...(a.pages ? { pages: a.pages } : {}) }));
   renderAttachments();
   els.attachError.hidden = true;
-  location.hash = '#compare';
+  goToCompare();
   els.prompt.focus();
+}
+
+/** Switch to Compare right away (not on the next hashchange), so focus can move there. */
+function goToCompare() {
+  if (location.hash !== '#compare') location.hash = '#compare';
+  showView();
+}
+
+/** Called from History: reopen a saved conversation in Compare to ask more. */
+function continueRun(saved) {
+  const run = normalizeRun(structuredClone(saved));
+  els.results.querySelector(`[data-run="${CSS.escape(run.id)}"]`)?.remove();
+  const view = showRunInCompare(run);
+  goToCompare();
+  view.el.scrollIntoView({ block: 'start' });
+  view.focusFollowUp();
 }
 
 // ---------------------------------------------------------------------------
@@ -515,10 +625,7 @@ async function init() {
     els.systemDetails.open = true;
   }
 
-  initHistory({
-    usePrompt,
-    providerById: (id) => state.providers.find((p) => p.id === id),
-  });
+  initHistory({ usePrompt, continueRun, providerById });
   initSettings({
     getProviders: () => state.providers,
     onApplied: onSettingsApplied,

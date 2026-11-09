@@ -11,6 +11,7 @@ const OPENAI_NON_CHAT =
 
 // `api` picks the wire format:
 //   openai      Chat Completions (OpenAI, Meta, Grok, DeepSeek, Kimi)
+// `streamUsage` providers accept stream_options.include_usage (token counts in a stream).
 //   anthropic   Anthropic Messages API
 //   gemini      Google generateContent
 //   perplexity  Perplexity Agent API (Responses format, with web search)
@@ -18,6 +19,7 @@ const OPENAI_NON_CHAT =
 export const PROVIDERS = [
   {
     id: 'openai',
+    streamUsage: true,
     name: 'OpenAI',
     vendor: 'OpenAI',
     api: 'openai',
@@ -71,6 +73,7 @@ export const PROVIDERS = [
   },
   {
     id: 'xai',
+    streamUsage: true,
     name: 'Grok',
     vendor: 'xAI',
     api: 'openai',
@@ -84,6 +87,7 @@ export const PROVIDERS = [
   },
   {
     id: 'deepseek',
+    streamUsage: true,
     name: 'DeepSeek',
     vendor: 'DeepSeek',
     api: 'openai',
@@ -110,6 +114,7 @@ export const PROVIDERS = [
   },
   {
     id: 'kimi',
+    streamUsage: true,
     name: 'Kimi',
     vendor: 'Moonshot AI',
     api: 'openai',
@@ -172,10 +177,25 @@ function trimSlash(url) {
 // ---------------------------------------------------------------------------
 
 /**
- * Build the HTTP request for a single-turn prompt.
+ * The conversation to send: earlier turns plus the new question, as
+ * [{role: 'user' | 'assistant', content}]. A plain `prompt` is a one-turn conversation.
+ */
+export function normalizeMessages({ prompt, messages }) {
+  if (Array.isArray(messages) && messages.length) {
+    return messages
+      .filter((m) => (m?.role === 'user' || m?.role === 'assistant') && typeof m.content === 'string' && m.content)
+      .map((m) => ({ role: m.role, content: m.content }));
+  }
+  return typeof prompt === 'string' && prompt ? [{ role: 'user', content: prompt }] : [];
+}
+
+/**
+ * Build the HTTP request for a conversation (or a single prompt).
+ * With `stream`, the provider sends the answer piece by piece (see createStreamParser).
  * @returns {{url: string, init: RequestInit}}
  */
-export function buildChatRequest(p, { model, prompt, system, maxTokens }) {
+export function buildChatRequest(p, { model, prompt, messages, system, maxTokens, stream = false }) {
+  const turns = normalizeMessages({ prompt, messages });
   switch (p.api) {
     case 'anthropic':
       return {
@@ -192,14 +212,16 @@ export function buildChatRequest(p, { model, prompt, system, maxTokens }) {
             // max_tokens is required by the Messages API.
             max_tokens: maxTokens,
             ...(system ? { system } : {}),
-            messages: [{ role: 'user', content: prompt }],
+            messages: turns,
+            ...(stream ? { stream: true } : {}),
           }),
         },
       };
 
-    case 'gemini':
+    case 'gemini': {
+      const method = stream ? 'streamGenerateContent?alt=sse' : 'generateContent';
       return {
-        url: `${p.baseUrl}/models/${encodeURIComponent(stripModelsPrefix(model))}:generateContent`,
+        url: `${p.baseUrl}/models/${encodeURIComponent(stripModelsPrefix(model))}:${method}`,
         init: {
           method: 'POST',
           headers: {
@@ -208,10 +230,11 @@ export function buildChatRequest(p, { model, prompt, system, maxTokens }) {
           },
           body: JSON.stringify({
             ...(system ? { systemInstruction: { parts: [{ text: system }] } } : {}),
-            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            contents: turns.map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
           }),
         },
       };
+    }
 
     case 'perplexity':
       // Perplexity's Agent API. Web search is opt-in, so always turn it on:
@@ -226,11 +249,14 @@ export function buildChatRequest(p, { model, prompt, system, maxTokens }) {
           },
           body: JSON.stringify({
             model,
-            input: prompt,
+            // One question is a plain string; a conversation is a list of message items.
+            input:
+              turns.length === 1 ? turns[0].content : turns.map((m) => ({ type: 'message', role: m.role, content: m.content })),
             ...(system ? { instructions: system } : {}),
             tools: [{ type: 'web_search' }],
             // The Agent API requires an output limit for anthropic/* models.
             ...(model.startsWith('anthropic/') ? { max_output_tokens: maxTokens } : {}),
+            ...(stream ? { stream: true } : {}),
           }),
         },
       };
@@ -248,10 +274,11 @@ export function buildChatRequest(p, { model, prompt, system, maxTokens }) {
           },
           body: JSON.stringify({
             model,
-            messages: [
-              ...(system ? [{ role: 'system', content: system }] : []),
-              { role: 'user', content: prompt },
-            ],
+            messages: [...(system ? [{ role: 'system', content: system }] : []), ...turns],
+            ...(stream ? { stream: true } : {}),
+            // Token counts in a stream must be asked for. Only sent to providers
+            // that document it (Meta's API doesn't).
+            ...(stream && p.streamUsage ? { stream_options: { include_usage: true } } : {}),
           }),
         },
       };
@@ -292,10 +319,7 @@ export function parseChatResponse(p, json) {
       return {
         text,
         model: json.modelVersion,
-        usage: {
-          input: json.usageMetadata?.promptTokenCount,
-          output: json.usageMetadata?.candidatesTokenCount,
-        },
+        usage: geminiUsage(json.usageMetadata),
         stopReason: candidate?.finishReason,
       };
     }
@@ -342,6 +366,15 @@ export function parseChatResponse(p, json) {
   }
 }
 
+/** Gemini bills its "thinking" tokens as output, so count them as output. */
+function geminiUsage(meta) {
+  if (!meta) return { input: undefined, output: undefined };
+  const output = meta.candidatesTokenCount == null && meta.thoughtsTokenCount == null
+    ? undefined
+    : (meta.candidatesTokenCount || 0) + (meta.thoughtsTokenCount || 0);
+  return { input: meta.promptTokenCount, output };
+}
+
 /** Keep only http(s) links, de-duplicated, with a readable title. */
 function cleanSources(list) {
   const seen = new Set();
@@ -366,6 +399,185 @@ function contentToText(content) {
 
 function stripModelsPrefix(model) {
   return model.replace(/^models\//, '');
+}
+
+// ---------------------------------------------------------------------------
+// Streaming
+// ---------------------------------------------------------------------------
+
+/**
+ * Split a server-sent events stream into events. Feed it text as it arrives;
+ * it returns the complete events ({event, data}) found so far.
+ */
+export function createSseReader() {
+  let buffer = '';
+  let event = '';
+  let data = [];
+  const ready = [];
+  const line = (text) => {
+    if (text === '') {
+      if (data.length) ready.push({ event, data: data.join('\n') });
+      event = '';
+      data = [];
+      return;
+    }
+    if (text.startsWith(':')) return; // comment / keep-alive
+    const colon = text.indexOf(':');
+    const field = colon < 0 ? text : text.slice(0, colon);
+    let value = colon < 0 ? '' : text.slice(colon + 1);
+    if (value.startsWith(' ')) value = value.slice(1);
+    if (field === 'event') event = value;
+    else if (field === 'data') data.push(value);
+  };
+  return {
+    push(text) {
+      buffer += text;
+      // A "\r" at the very end may be the first half of "\r\n": wait for more.
+      const hold = buffer.endsWith('\r') ? 1 : 0;
+      const lines = buffer.slice(0, buffer.length - hold).split(/\r\n|\r|\n/);
+      buffer = lines.pop() + buffer.slice(buffer.length - hold);
+      for (const l of lines) line(l);
+      return ready.splice(0);
+    },
+    end() {
+      if (buffer) line(buffer.replace(/\r$/, ''));
+      buffer = '';
+      line('');
+      return ready.splice(0);
+    },
+  };
+}
+
+/**
+ * Turns one provider's stream events into answer text.
+ *   feed({event, data}) -> [{type: 'delta', text} | {type: 'thinking'}]   (throws on an error event)
+ *   finish()            -> {text, model, usage, stopReason, sources}
+ */
+export function createStreamParser(p) {
+  let text = '';
+  let model;
+  let stopReason;
+  let sources = [];
+  const usage = { input: undefined, output: undefined };
+  const out = [];
+  const addText = (t) => {
+    if (typeof t === 'string' && t) {
+      text += t;
+      out.push({ type: 'delta', text: t });
+    }
+  };
+  const parse = (data) => {
+    try {
+      return JSON.parse(data);
+    } catch {
+      return null;
+    }
+  };
+
+  const handlers = {
+    openai({ data }) {
+      if (data === '[DONE]') return;
+      const json = parse(data);
+      if (!json) return;
+      if (json.error) throw new Error(json.error.message || 'The provider reported an error');
+      if (json.model) model = json.model;
+      const choice = json.choices?.[0];
+      // Usage arrives on the last chunk (or a final chunk with no choices).
+      const u = json.usage || choice?.usage;
+      if (u) {
+        if (u.prompt_tokens != null) usage.input = u.prompt_tokens;
+        if (u.completion_tokens != null) usage.output = u.completion_tokens;
+      }
+      if (choice?.finish_reason) stopReason = choice.finish_reason;
+      const delta = choice?.delta || {};
+      if (delta.reasoning_content || delta.reasoning) out.push({ type: 'thinking' });
+      addText(contentToText(delta.content));
+      if (Array.isArray(delta.annotations)) {
+        sources = cleanSources([
+          ...sources,
+          ...delta.annotations
+            .filter((a) => a?.type === 'url_citation')
+            .map((a) => ({ title: a.url_citation?.title, url: a.url_citation?.url })),
+        ]);
+      }
+    },
+
+    anthropic({ event, data }) {
+      const json = parse(data);
+      if (!json) return;
+      switch (json.type || event) {
+        case 'message_start':
+          model = json.message?.model || model;
+          if (json.message?.usage?.input_tokens != null) usage.input = json.message.usage.input_tokens;
+          if (json.message?.usage?.output_tokens != null) usage.output = json.message.usage.output_tokens;
+          break;
+        case 'content_block_delta':
+          if (json.delta?.type === 'text_delta') addText(json.delta.text);
+          else if (json.delta?.type === 'thinking_delta') out.push({ type: 'thinking' });
+          break;
+        case 'message_delta':
+          // These counts are cumulative, so the last one wins.
+          if (json.usage?.output_tokens != null) usage.output = json.usage.output_tokens;
+          if (json.usage?.input_tokens != null) usage.input = json.usage.input_tokens;
+          if (json.delta?.stop_reason) stopReason = json.delta.stop_reason;
+          break;
+        case 'error':
+          throw new Error(json.error?.message || 'Claude reported an error');
+      }
+    },
+
+    gemini({ data }) {
+      const json = parse(data);
+      if (!json) return;
+      if (json.error) throw new Error(json.error.message || 'Gemini reported an error');
+      if (json.promptFeedback?.blockReason && !json.candidates?.length) {
+        throw new Error(`Prompt blocked by Gemini: ${json.promptFeedback.blockReason}`);
+      }
+      if (json.modelVersion) model = json.modelVersion;
+      if (json.usageMetadata) Object.assign(usage, geminiUsage(json.usageMetadata));
+      const candidate = json.candidates?.[0];
+      if (candidate?.finishReason) stopReason = candidate.finishReason;
+      for (const part of candidate?.content?.parts || []) {
+        if (part.thought) out.push({ type: 'thinking' });
+        else addText(part.text);
+      }
+    },
+
+    perplexity({ data }) {
+      const json = parse(data);
+      if (!json) return;
+      switch (json.type) {
+        case 'response.output_text.delta':
+          addText(json.delta);
+          break;
+        case 'response.completed': {
+          const final = parseChatResponse(p, json.response || {});
+          if (!text) addText(final.text);
+          model = final.model || model;
+          Object.assign(usage, final.usage);
+          stopReason = final.stopReason;
+          sources = final.sources || [];
+          break;
+        }
+        case 'response.failed':
+          throw new Error(json.response?.error?.message || json.error?.message || 'Perplexity reported an error');
+        default:
+          if (String(json.type).startsWith('response.reasoning')) out.push({ type: 'thinking' });
+      }
+    },
+  };
+  const handle = handlers[p.api];
+  if (!handle) throw new Error(`Unknown provider api: ${p.api}`);
+
+  return {
+    feed(event) {
+      handle(event);
+      return out.splice(0);
+    },
+    finish() {
+      return { text, model, usage, stopReason, ...(sources.length ? { sources } : {}) };
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
