@@ -13,9 +13,7 @@
 // webhook arrives, or when the browser comes back from Checkout, whichever is
 // first; each Checkout session is credited only once.
 
-import { createHmac, randomBytes, randomUUID, scrypt, timingSafeEqual, createHash } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import path from 'node:path';
+import { createHmac, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 
 const scryptAsync = promisify(scrypt);
@@ -23,8 +21,7 @@ const scryptAsync = promisify(scrypt);
 export const MICROS_PER_DOLLAR = 1_000_000;
 export const MICROS_PER_CENT = 10_000;
 export const SESSION_COOKIE = 'dai_session';
-const SESSION_DAYS = 30;
-const USAGE_KEEP_PER_USER = 1000;
+export const SESSION_DAYS = 30;
 const WEBHOOK_TOLERANCE_S = 300;
 
 export const BILLING_VARIABLES = [
@@ -38,7 +35,7 @@ export const BILLING_VARIABLES = [
   'EMAIL_FROM',
 ];
 export const BILLING_SECRET_VARIABLES = ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET', 'RESEND_API_KEY'];
-const RESET_TOKEN_MINUTES = 60;
+export const RESET_TOKEN_MINUTES = 60;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -157,270 +154,7 @@ export async function verifyPassword(password, stored) {
   return timingSafeEqual(actual, expected);
 }
 
-const hashToken = (token) => createHash('sha256').update(token).digest('base64url');
-
 export const EMAIL_RE = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/;
-
-// ---------------------------------------------------------------------------
-// Store: one JSON file, written atomically, with writes queued one at a time.
-// Fine for a small site; move to a database before you have many thousands of users.
-// ---------------------------------------------------------------------------
-
-export class BillingStore {
-  constructor(file) {
-    this.file = file;
-    this.data = null;
-    this.queue = Promise.resolve();
-  }
-
-  async load() {
-    if (this.data) return this.data;
-    try {
-      this.data = JSON.parse(await readFile(this.file, 'utf8'));
-    } catch (err) {
-      if (err.code !== 'ENOENT') throw err;
-      this.data = {};
-    }
-    this.data.users ??= {};
-    this.data.emails ??= {};
-    this.data.sessions ??= {};
-    this.data.usage ??= [];
-    this.data.payments ??= {};
-    this.data.resets ??= {};
-    this.data.adjustments ??= [];
-    return this.data;
-  }
-
-  /** Run fn(data) with exclusive access and save afterwards. */
-  update(fn) {
-    const run = this.queue.then(async () => {
-      const data = await this.load();
-      const result = await fn(data);
-      await mkdir(path.dirname(this.file), { recursive: true });
-      const tmp = `${this.file}.${process.pid}.tmp`;
-      await writeFile(tmp, JSON.stringify(data), { mode: 0o600 });
-      await rename(tmp, this.file);
-      return result;
-    });
-    this.queue = run.catch(() => {});
-    return run;
-  }
-
-  async read(fn) {
-    await this.queue;
-    return fn(await this.load());
-  }
-
-  // --- Accounts -------------------------------------------------------------
-
-  async createUser(email, password) {
-    const passwordHash = await hashPassword(password);
-    return this.update((data) => {
-      if (data.emails[email]) return null;
-      const user = { id: randomUUID(), email, passwordHash, balance: 0, createdAt: new Date().toISOString() };
-      data.users[user.id] = user;
-      data.emails[email] = user.id;
-      return user;
-    });
-  }
-
-  async findByEmail(email) {
-    return this.read((data) => data.users[data.emails[email]] || null);
-  }
-
-  async getUser(id) {
-    return this.read((data) => data.users[id] || null);
-  }
-
-  async createSession(userId) {
-    const token = randomBytes(32).toString('base64url');
-    const expiresAt = Date.now() + SESSION_DAYS * 86_400_000;
-    await this.update((data) => {
-      const now = Date.now();
-      for (const [key, s] of Object.entries(data.sessions)) if (s.expiresAt < now) delete data.sessions[key];
-      data.sessions[hashToken(token)] = { userId, expiresAt };
-    });
-    return { token, maxAge: SESSION_DAYS * 86_400 };
-  }
-
-  async userForToken(token) {
-    if (!token) return null;
-    return this.read((data) => {
-      const s = data.sessions[hashToken(token)];
-      if (!s || s.expiresAt < Date.now()) return null;
-      return data.users[s.userId] || null;
-    });
-  }
-
-  async deleteSession(token) {
-    if (!token) return;
-    await this.update((data) => {
-      delete data.sessions[hashToken(token)];
-    });
-  }
-
-  // --- Money ----------------------------------------------------------------
-
-  /** Charge a finished answer and record it. Returns the new balance. */
-  async charge(userId, entry) {
-    return this.update((data) => {
-      const user = data.users[userId];
-      if (!user) throw new Error('Account not found');
-      user.balance -= entry.cost;
-      data.usage.push({ userId, at: new Date().toISOString(), ...entry });
-      trimUsage(data, userId);
-      return user.balance;
-    });
-  }
-
-  /** Add credit for a Checkout session, once. Returns {credited, balance}. */
-  async credit(userId, checkoutId, cents, paymentIntent = '') {
-    return this.update((data) => {
-      const user = data.users[userId];
-      if (!user) throw new Error('Account not found');
-      if (data.payments[checkoutId]) return { credited: false, balance: user.balance };
-      data.payments[checkoutId] = { userId, cents, paymentIntent, refundedCents: 0, at: new Date().toISOString() };
-      user.balance += cents * MICROS_PER_CENT;
-      return { credited: true, balance: user.balance };
-    });
-  }
-
-  async account(userId, limit = 100) {
-    return this.read((data) => {
-      const user = data.users[userId];
-      if (!user) return null;
-      const usage = [];
-      for (let i = data.usage.length - 1; i >= 0 && usage.length < limit; i--) {
-        if (data.usage[i].userId === userId) {
-          const { userId: _omit, ...rest } = data.usage[i];
-          usage.push(rest);
-        }
-      }
-      return { email: user.email, balance: user.balance, usage, payments: paymentsOf(data, userId) };
-    });
-  }
-
-  // --- Password reset -------------------------------------------------------
-
-  /** A one-time reset token for this email, or null if there's no such account. */
-  async createReset(email) {
-    return this.update((data) => {
-      const userId = data.emails[email];
-      if (!userId) return null;
-      const now = Date.now();
-      for (const [key, r] of Object.entries(data.resets)) {
-        // Drop expired tokens, and older tokens for this user: only the newest link works.
-        if (r.expiresAt < now || r.userId === userId) delete data.resets[key];
-      }
-      const token = randomBytes(32).toString('base64url');
-      data.resets[hashToken(token)] = { userId, expiresAt: now + RESET_TOKEN_MINUTES * 60_000 };
-      return token;
-    });
-  }
-
-  /** Set a new password with a reset token. Signs the user out everywhere. Returns the user, or null. */
-  async resetPassword(token, password) {
-    const passwordHash = await hashPassword(password);
-    return this.update((data) => {
-      const key = hashToken(String(token || ''));
-      const reset = data.resets[key];
-      if (!reset) return null;
-      delete data.resets[key];
-      const user = data.users[reset.userId];
-      if (!user || reset.expiresAt < Date.now()) return null;
-      user.passwordHash = passwordHash;
-      for (const [k, s] of Object.entries(data.sessions)) if (s.userId === user.id) delete data.sessions[k];
-      return user;
-    });
-  }
-
-  // --- Admin ----------------------------------------------------------------
-
-  /** Every account with totals, newest first, optionally filtered by email. */
-  async listUsers(query = '') {
-    const q = query.trim().toLowerCase();
-    return this.read((data) => {
-      const totals = new Map();
-      for (const u of data.usage) {
-        const t = totals.get(u.userId) || { spent: 0, answers: 0 };
-        t.spent += u.cost;
-        t.answers += 1;
-        totals.set(u.userId, t);
-      }
-      const paid = new Map();
-      for (const p of Object.values(data.payments)) {
-        paid.set(p.userId, (paid.get(p.userId) || 0) + p.cents - (p.refundedCents || 0));
-      }
-      return Object.values(data.users)
-        .filter((u) => !q || u.email.includes(q))
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-        .map((u) => ({
-          id: u.id,
-          email: u.email,
-          createdAt: u.createdAt,
-          balance: u.balance,
-          paidCents: paid.get(u.id) || 0,
-          spent: totals.get(u.id)?.spent || 0,
-          answers: totals.get(u.id)?.answers || 0,
-        }));
-    });
-  }
-
-  /** One account in full, for the admin view. */
-  async adminUser(userId) {
-    const account = await this.account(userId, 50);
-    if (!account) return null;
-    return this.read((data) => ({ id: userId, createdAt: data.users[userId].createdAt, ...account }));
-  }
-
-  /** Add (or, with negative cents, take away) credit by hand. Returns the new balance. */
-  async adjust(userId, cents, note, by) {
-    return this.update((data) => {
-      const user = data.users[userId];
-      if (!user) throw new Error('Account not found');
-      user.balance += cents * MICROS_PER_CENT;
-      data.adjustments.push({ userId, cents, note, by, at: new Date().toISOString() });
-      return user.balance;
-    });
-  }
-
-  async payment(checkoutId) {
-    return this.read((data) => data.payments[checkoutId] || null);
-  }
-
-  /** Record a Stripe refund: the refunded amount comes off the balance. Returns the new balance. */
-  async recordRefund(checkoutId, cents, by) {
-    return this.update((data) => {
-      const payment = data.payments[checkoutId];
-      if (!payment) throw new Error('Payment not found');
-      if ((payment.refundedCents || 0) + cents > payment.cents) throw new Error('That is more than is left to refund.');
-      payment.refundedCents = (payment.refundedCents || 0) + cents;
-      const user = data.users[payment.userId];
-      user.balance -= cents * MICROS_PER_CENT;
-      data.adjustments.push({ userId: payment.userId, cents: -cents, note: 'Refund to card', by, at: new Date().toISOString() });
-      return user.balance;
-    });
-  }
-}
-
-/** Card payments and manual credits for one user, newest first. */
-function paymentsOf(data, userId) {
-  const payments = Object.entries(data.payments)
-    .filter(([, p]) => p.userId === userId)
-    .map(([id, p]) => ({ id, kind: 'card', cents: p.cents, refundedCents: p.refundedCents || 0, at: p.at }));
-  const adjustments = data.adjustments
-    .filter((a) => a.userId === userId && a.note !== 'Refund to card')
-    .map((a) => ({ kind: 'credit', cents: a.cents, note: a.note, at: a.at }));
-  return [...payments, ...adjustments].sort((a, b) => b.at.localeCompare(a.at));
-}
-
-function trimUsage(data, userId) {
-  let count = 0;
-  for (let i = data.usage.length - 1; i >= 0; i--) {
-    if (data.usage[i].userId !== userId) continue;
-    if (++count > USAGE_KEEP_PER_USER) data.usage.splice(i, 1);
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Stripe (REST API over fetch, so there are no dependencies)

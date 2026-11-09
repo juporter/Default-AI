@@ -1,0 +1,41 @@
+# Fly.io settings. See DEPLOY.md for the step-by-step guide.
+# `fly launch` replaces "app" with your app's name the first time you run it.
+
+app = "default-ai-prompt"
+primary_region = "iad"   # change to a region near your users: `fly platform regions`
+
+[build]
+  # Uses the Dockerfile in this folder.
+
+[env]
+  HOST = "0.0.0.0"
+  PORT = "8080"
+  # Keep the billing database on the persistent volume mounted below.
+  BILLING_DATA_FILE = "/data/billing.db"
+  # Fly's proxy sends the visitor's real address in this header. The app uses
+  # it so sign-in rate limits apply per visitor, not to everyone at once.
+  CLIENT_IP_HEADER = "fly-client-ip"
+
+[mounts]
+  source = "data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Always on, exactly one machine: SQLite lives on one volume, so never scale
+  # this app beyond one machine.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "10s"
+    interval = "30s"
+    method = "GET"
+    path = "/api/config"
+    timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
